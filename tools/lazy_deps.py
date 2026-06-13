@@ -180,6 +180,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # call site uses prompt=False so it can never raise a blocking input()
     # prompt mid-session (#40490).
     "tool.vision": ("Pillow==12.2.0",),
+    "tool.trace_upload": ("huggingface-hub==1.2.3",),
 }
 
 

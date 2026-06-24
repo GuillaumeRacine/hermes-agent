@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Optional
 
-from agent.billing_view import format_money, parse_money
+from agent.billing_view import parse_money
 
 logger = logging.getLogger(__name__)
 

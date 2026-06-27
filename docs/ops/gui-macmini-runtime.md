@@ -37,7 +37,7 @@ Important runtime files:
 - Default config: `/Users/gui/.hermes/config.yaml`
 - Default loaded soul: `/Users/gui/.hermes/SOUL.md`
 - Canonical soul source: `/Users/gui/.hermes/MASTER_SOUL.md`
-- Profile roots: `/Users/gui/.hermes/profiles/{ops,personal,research}`
+- Profile roots: `/Users/gui/.hermes/profiles/{music,ops,personal,research,tao}`
 - Soul sync script: `/Users/gui/.hermes/scripts/sync_souls.sh`
 - Gateway watchdog: `/Users/gui/.hermes/scripts/gateway_watchdog.py`
 
@@ -105,6 +105,70 @@ Known remaining warnings:
   are refreshed or removed.
 - Slack Socket Mode disconnect/backfill and long-turn latency need a separate
   evidence pass before code changes.
+
+## Tao Profile
+
+Local profile:
+
+- Name: `tao`
+- Alias: `/Users/gui/.local/bin/tao`
+- Root: `/Users/gui/.hermes/profiles/tao`
+- Model at creation: `gpt-5.4` via `openai-codex`
+- Gateway status at creation: stopped
+
+Purpose:
+
+- Outcome owner for Tao of Founders editorial quality, audience resonance,
+  virality, reach, engagement, and the weekly growth learning loop.
+- Sits above the Tao repo agents. It does not replace repo ownership in
+  `tao-content`, `tao-growth`, `tao-insights`, or `tao-commerce`.
+- Approval-gated for all outward actions: publishing, scheduling, posting,
+  DMs, comments, email, lead contact, DNS, Ghost/Substack/Shopify settings, and
+  mailing-list changes.
+
+Context sources covered in the profile:
+
+| Source | Role |
+|---|---|
+| `/Volumes/SSD/1_Projects/Apps/tao-of-founders/README.md` | Current Tao umbrella and repo split |
+| `/Volumes/SSD/1_Projects/Apps/tao-of-founders/*/AGENTS.md` | Repo-specific boundaries and sensitive-file rules |
+| `/Users/gui/.claude/projects/-Users-gui/memory/tao_growth_system.md` | Claude-built growth system memory |
+| `/Users/gui/.claude/projects/-Volumes-SSD-1-Projects-Apps-tao-founders/memory/project_domain_setup.md` | Current domain architecture |
+| `/Users/gui/.claude/projects/-Volumes-SSD-1-Projects-Apps-tao-founders/memory/reference_posting_pipeline.md` | Active Substack Notes pipeline reference |
+| `/Users/gui/Context/scripts/substack_notes/RUNBOOK_NOTES.md` | Substack Notes operating runbook |
+| `/Users/gui/Context/scripts/substack_notes/NOTES_STRATEGY.md` | Notes voice, format, cadence, and engagement strategy |
+| `/Users/gui/Context/scripts/tao_analytics.py` | Legacy/partial analytics script; verify against newer PostHog notes before relying on it |
+| `/Users/gui/Context/data/tao_analytics/analytics_2026-04-02.md` | Historical analytics snapshot |
+| `/Users/gui/.gemini/tmp/gui/AGENT_HANDOFF_SUBSTACK.md` | Historical Substack extraction handoff |
+| `/Volumes/SSD/1_Projects/Apps/tao-founders/archive/tao-apps/growth_system.md` | Legacy acquisition and metrics model |
+
+Important reconciliation notes:
+
+- Prefer the current `tao-of-founders` four-repo split over older monorepo
+  paths when docs conflict.
+- Later Claude memory says PostHog replaced Plausible on 2026-04-13; treat the
+  Plausible-based analytics script as legacy until refreshed.
+- `post_note_v2.py`, `schedule.json`, `pool.json`, launchd controls, and any
+  Substack/Ghost/Shopify/lead-contact operation are outward-action surfaces.
+  Use status/dry-run first and require Gui approval before writes.
+
+Validation performed on 2026-06-27:
+
+```bash
+/Users/gui/.local/bin/hermes profile show tao
+/Users/gui/.local/bin/hermes profile list
+perl -ne 'while(/([\x{200B}-\x{200D}\x{FEFF}\x{2060}])/g){ printf "%s:%d invisible U+%04X\n", $ARGV, $., ord($1) }' \
+  /Users/gui/.hermes/profiles/tao/SOUL.md \
+  /Users/gui/.hermes/profiles/tao/memories/MEMORY.md \
+  /Users/gui/.hermes/profiles/tao/memories/USER.md
+```
+
+Expected result:
+
+- `tao` appears in `hermes profile list`.
+- `hermes profile show tao` reports existing `.env`, `SOUL.md`, alias, and
+  profile root.
+- The invisible-Unicode scan prints no matches.
 
 ## Validation Commands
 

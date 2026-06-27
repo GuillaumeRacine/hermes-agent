@@ -696,11 +696,12 @@ class TestBuildExecuteCodeSchema(unittest.TestCase):
         self.assertNotIn("import , ...", code_desc)
 
     def test_description_mentions_limits(self):
-        schema = build_execute_code_schema()
+        with patch("tools.code_execution_tool._load_config", return_value={"timeout": 180, "max_tool_calls": 25}):
+            schema = build_execute_code_schema()
         desc = schema["description"]
-        self.assertIn("5-minute timeout", desc)
+        self.assertIn("180s timeout", desc)
         self.assertIn("50KB", desc)
-        self.assertIn("50 tool calls", desc)
+        self.assertIn("25 tool calls", desc)
 
     def test_description_mentions_helpers(self):
         schema = build_execute_code_schema()

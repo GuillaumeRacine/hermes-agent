@@ -22,6 +22,7 @@ Usage examples::
 import re
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Sequence
@@ -53,8 +54,53 @@ _LOGGER_NAME_RE = re.compile(
     r"\s+(\S+):"                                 # logger name
 )
 
+_GATEWAY_INBOUND_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}),\d+\s+INFO\s+"
+    r"gateway\.run:\s+inbound message:\s+platform=(?P<platform>\S+)\s+"
+    r"user=(?P<user>\S+)\s+chat=(?P<chat>\S+)\s+msg='(?P<msg>.*)'"
+)
+_GATEWAY_RESPONSE_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}),\d+\s+INFO\s+"
+    r"gateway\.run:\s+response ready:\s+platform=(?P<platform>\S+)\s+"
+    r"chat=(?P<chat>\S+)\s+time=(?P<duration>[0-9.]+)s\s+"
+    r"api_calls=(?P<api_calls>\d+)\s+response=(?P<chars>\d+)\s+chars"
+)
+_SESSION_TAG_RE = re.compile(r"\[([0-9]{8}_[0-9]{6}_[A-Za-z0-9]+)\]")
+_TOOL_ERROR_RE = re.compile(r"Tool\s+(?P<tool>\w+)\s+returned error\s+\((?P<duration>[0-9.]+)s\)")
+_EXEC_TIMEOUT_RE = re.compile(
+    r"execute_code timed out after (?P<duration>[0-9.]+)s "
+    r"\(limit (?P<limit>[0-9.]+)s\) with (?P<tool_calls>\d+) tool calls"
+)
+_SOUL_BLOCK_RE = re.compile(r"Context file SOUL\.md blocked:\s+(?P<reason>\S+)")
+_SOCKET_MODE_RE = re.compile(r"Socket Mode unhealthy \((?P<reason>[^)]+)\)")
+
 # Level ordering for >= filtering
 _LEVEL_ORDER = {"DEBUG": 0, "INFO": 1, "WARNING": 2, "ERROR": 3, "CRITICAL": 4}
+
+
+@dataclass
+class SlowTurn:
+    """Parsed gateway turn above the configured slow-turn threshold."""
+
+    started_at: Optional[datetime]
+    completed_at: datetime
+    platform: str
+    chat: str
+    duration_s: float
+    api_calls: int
+    response_chars: int
+    message: str = ""
+    session_ids: set[str] = field(default_factory=set)
+    indicators: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SlowTurnReport:
+    """Structured output for `hermes logs slow-turns`."""
+
+    threshold_s: float
+    slow_turns: list[SlowTurn]
+    socket_disconnects: list[str]
 
 
 def _parse_since(since_str: str) -> Optional[datetime]:
@@ -86,6 +132,138 @@ def _parse_line_timestamp(line: str) -> Optional[datetime]:
         return datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
     except ValueError:
         return None
+
+
+def _parse_log_datetime(match: re.Match[str]) -> datetime:
+    return datetime.strptime(match.group("ts"), "%Y-%m-%d %H:%M:%S")
+
+
+def _extract_session_ids(line: str) -> set[str]:
+    return set(_SESSION_TAG_RE.findall(line))
+
+
+def _error_indicator(line: str) -> Optional[str]:
+    """Summarize a log line that commonly explains slow gateway turns."""
+    session_ids = _extract_session_ids(line)
+    prefix = f"{','.join(sorted(session_ids))}: " if session_ids else ""
+
+    if m := _EXEC_TIMEOUT_RE.search(line):
+        return (
+            f"{prefix}execute_code timeout "
+            f"{m.group('duration')}s/{m.group('limit')}s, "
+            f"{m.group('tool_calls')} inner tool calls"
+        )
+    if m := _TOOL_ERROR_RE.search(line):
+        return f"{prefix}{m.group('tool')} error after {m.group('duration')}s"
+    if m := _SOUL_BLOCK_RE.search(line):
+        return f"{prefix}SOUL blocked ({m.group('reason')})"
+    if "API call failed" in line:
+        return f"{prefix}API call failed"
+    if "Retrying API call" in line:
+        return f"{prefix}API retry"
+    if "Socket Mode unhealthy" in line and (m := _SOCKET_MODE_RE.search(line)):
+        return f"Slack Socket Mode unhealthy ({m.group('reason')})"
+    return None
+
+
+def analyze_slow_turns(
+    gateway_lines: Sequence[str],
+    error_lines: Sequence[str],
+    *,
+    threshold_s: float = 300.0,
+) -> SlowTurnReport:
+    """Parse gateway/errors logs and summarize slow user-facing turns.
+
+    The gateway's response-ready line carries duration/api-call data, while
+    errors.log carries the explanatory breadcrumbs.  This joins them by time
+    window and session tags so operators can distinguish model latency from
+    bad tool loops, prompt-safety drops, and Socket Mode reconnects.
+    """
+    last_inbound: dict[tuple[str, str], tuple[datetime, str]] = {}
+    slow_turns: list[SlowTurn] = []
+    socket_disconnects: list[str] = []
+
+    for line in gateway_lines:
+        if m := _SOCKET_MODE_RE.search(line):
+            ts = _parse_line_timestamp(line)
+            when = ts.strftime("%Y-%m-%d %H:%M:%S") if ts else "unknown time"
+            socket_disconnects.append(f"{when}: {m.group('reason')}")
+
+        if m := _GATEWAY_INBOUND_RE.match(line):
+            key = (m.group("platform"), m.group("chat"))
+            last_inbound[key] = (_parse_log_datetime(m), m.group("msg"))
+            continue
+
+        if not (m := _GATEWAY_RESPONSE_RE.match(line)):
+            continue
+
+        duration_s = float(m.group("duration"))
+        if duration_s < threshold_s:
+            continue
+
+        key = (m.group("platform"), m.group("chat"))
+        started_at, message = last_inbound.get(key, (None, ""))
+        completed_at = _parse_log_datetime(m)
+        slow_turns.append(
+            SlowTurn(
+                started_at=started_at,
+                completed_at=completed_at,
+                platform=m.group("platform"),
+                chat=m.group("chat"),
+                duration_s=duration_s,
+                api_calls=int(m.group("api_calls")),
+                response_chars=int(m.group("chars")),
+                message=message,
+            )
+        )
+
+    for turn in slow_turns:
+        window_start = turn.started_at or (turn.completed_at - timedelta(seconds=turn.duration_s))
+        for line in error_lines:
+            ts = _parse_line_timestamp(line)
+            if ts is None or ts < window_start or ts > turn.completed_at:
+                continue
+            indicator = _error_indicator(line)
+            if not indicator:
+                continue
+            turn.session_ids.update(_extract_session_ids(line))
+            if indicator not in turn.indicators:
+                turn.indicators.append(indicator)
+
+    return SlowTurnReport(
+        threshold_s=threshold_s,
+        slow_turns=slow_turns,
+        socket_disconnects=socket_disconnects,
+    )
+
+
+def render_slow_turn_report(report: SlowTurnReport) -> str:
+    """Render a compact slow-turn report for CLI output and issue comments."""
+    lines = [f"Slow gateway turns >= {report.threshold_s:g}s"]
+    if not report.slow_turns:
+        lines.append("No slow turns found.")
+    for idx, turn in enumerate(report.slow_turns, 1):
+        start = turn.started_at.strftime("%Y-%m-%d %H:%M:%S") if turn.started_at else "unknown"
+        sessions = ",".join(sorted(turn.session_ids)) or "-"
+        message = turn.message[:96]
+        lines.append(
+            f"{idx}. {start} -> {turn.completed_at:%Y-%m-%d %H:%M:%S} "
+            f"{turn.platform}:{turn.chat} {turn.duration_s:g}s "
+            f"api_calls={turn.api_calls} response_chars={turn.response_chars} "
+            f"sessions={sessions}"
+        )
+        if message:
+            lines.append(f"   msg={message!r}")
+        if turn.indicators:
+            lines.append("   indicators:")
+            for indicator in turn.indicators[:8]:
+                lines.append(f"   - {indicator}")
+    if report.socket_disconnects:
+        lines.append("")
+        lines.append("Socket Mode reconnects:")
+        for entry in report.socket_disconnects[-10:]:
+            lines.append(f"- {entry}")
+    return "\n".join(lines)
 
 
 def _extract_level(line: str) -> Optional[str]:
@@ -248,6 +426,37 @@ def tail_log(
                      since=since_dt, component_prefixes=component_prefixes)
     except KeyboardInterrupt:
         print("\n--- stopped ---")
+
+
+def print_slow_turns(
+    *,
+    threshold_s: float = 300.0,
+    since: Optional[str] = None,
+) -> None:
+    """Print a slow-turn summary from gateway.log plus errors.log."""
+    log_dir = get_hermes_home() / "logs"
+    gateway_path = log_dir / "gateway.log"
+    errors_path = log_dir / "errors.log"
+    if not gateway_path.exists():
+        print(f"Log file not found: {gateway_path}")
+        sys.exit(1)
+
+    since_dt = _parse_since(since) if since else None
+    if since and since_dt is None:
+        print(f"Invalid --since value: {since!r}. Use format like '1h', '30m', '2d'.")
+        sys.exit(1)
+
+    gateway_lines = _read_tail(gateway_path, 20_000, has_filters=since_dt is not None, since=since_dt)
+    error_lines = []
+    if errors_path.exists():
+        error_lines = _read_tail(errors_path, 20_000, has_filters=since_dt is not None, since=since_dt)
+
+    report = analyze_slow_turns(
+        gateway_lines,
+        error_lines,
+        threshold_s=threshold_s,
+    )
+    print(render_slow_turn_report(report))
 
 
 def _read_tail(

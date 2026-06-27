@@ -117,6 +117,13 @@ Run these after runtime config or source changes:
 launchctl list | rg 'hermes|session-skill-review'
 ```
 
+Summarize recent slow gateway turns:
+
+```bash
+cd /Users/gui/.hermes/hermes-agent
+venv/bin/python -m hermes_cli.main logs slow-turns --threshold 300 --since 7d
+```
+
 Scan loaded souls for hidden prompt-safety blockers:
 
 ```bash

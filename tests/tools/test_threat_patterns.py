@@ -299,6 +299,14 @@ class TestInvisibleUnicode:
         findings = scan_for_threats("normal text\u200b", scope="all")
         assert any(f.startswith("invisible_unicode_U+200B") for f in findings)
 
+    def test_text_zero_width_joiner_detected(self):
+        findings = scan_for_threats("family\u200dadmin", scope="all")
+        assert any(f.startswith("invisible_unicode_U+200D") for f in findings)
+
+    def test_emoji_zero_width_joiner_allowed(self):
+        findings = scan_for_threats("calendar: 👨\u200d👩\u200d👧 Personal", scope="all")
+        assert not any(f.startswith("invisible_unicode_U+200D") for f in findings)
+
     def test_directional_isolate_detected(self):
         findings = scan_for_threats("rtl override\u2066here", scope="all")
         assert any(f.startswith("invisible_unicode_U+2066") for f in findings)

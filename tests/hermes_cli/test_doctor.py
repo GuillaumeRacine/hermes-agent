@@ -268,9 +268,11 @@ class TestDoctorMemoryProviderSection:
         (home / "config.yaml").write_text(yaml.dump(config))
         return home
 
-    def _run_doctor_and_capture(self, monkeypatch, tmp_path, provider=""):
+    def _run_doctor_and_capture(self, monkeypatch, tmp_path, provider="", soul_text=None):
         """Run doctor and capture stdout."""
         home = self._make_hermes_home(tmp_path, provider)
+        if soul_text is not None:
+            (home / "SOUL.md").write_text(soul_text, encoding="utf-8")
         monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
         monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
         monkeypatch.setattr(doctor_mod, "_DHH", str(home))
@@ -322,6 +324,26 @@ class TestDoctorMemoryProviderSection:
         out = self._run_doctor_and_capture(monkeypatch, tmp_path, provider="mem0")
         assert "Memory Provider" in out
         assert "Built-in memory active" not in out
+
+    def test_warns_when_soul_would_be_blocked(self, monkeypatch, tmp_path):
+        out = self._run_doctor_and_capture(
+            monkeypatch,
+            tmp_path,
+            soul_text="Use the admin charter.\u200b\n",
+        )
+
+        assert "SOUL.md blocked by prompt-safety scan" in out
+        assert "invisible_unicode_U+200B" in out
+
+    def test_allows_emoji_zwj_in_soul(self, monkeypatch, tmp_path):
+        out = self._run_doctor_and_capture(
+            monkeypatch,
+            tmp_path,
+            soul_text="Route 👨\u200d👩\u200d👧 Personal & Family tasks correctly.\n",
+        )
+
+        assert "SOUL.md exists (persona configured)" in out
+        assert "SOUL.md blocked by prompt-safety scan" not in out
 
 
 def test_run_doctor_termux_treats_docker_and_browser_warnings_as_expected(monkeypatch, tmp_path):

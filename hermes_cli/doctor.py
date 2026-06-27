@@ -1154,6 +1154,16 @@ def run_doctor(args):
         lines = [l for l in content.splitlines() if l.strip() and not l.strip().startswith(("<!--", "-->", "#"))]
         if lines:
             check_ok(f"{_DHH}/SOUL.md exists (persona configured)")
+            try:
+                from tools.threat_patterns import scan_for_threats
+                findings = scan_for_threats(content, scope="context")
+            except Exception as e:
+                check_warn("SOUL.md prompt-safety scan skipped", f"({e})")
+            else:
+                if findings:
+                    finding_text = ", ".join(findings)
+                    check_warn("SOUL.md blocked by prompt-safety scan", f"({finding_text})")
+                    issues.append("Fix SOUL.md prompt-safety findings so the persona is loaded into context")
         else:
             check_info(f"{_DHH}/SOUL.md exists but is empty — edit it to customize personality")
     else:

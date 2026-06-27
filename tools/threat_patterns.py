@@ -144,6 +144,58 @@ INVISIBLE_CHARS = frozenset({
     '\u2069',  # pop directional isolate
 })
 
+_VARIATION_SELECTORS = frozenset({"\ufe0e", "\ufe0f"})
+
+
+def _is_emoji_codepoint(ch: str) -> bool:
+    """Best-effort emoji range check for legitimate ZWJ emoji sequences."""
+    cp = ord(ch)
+    return (
+        0x1F000 <= cp <= 0x1FAFF
+        or 0x2600 <= cp <= 0x27BF
+    )
+
+
+def _neighbor_emoji(content: str, start: int, step: int) -> bool:
+    i = start
+    while 0 <= i < len(content):
+        ch = content[i]
+        if ch in _VARIATION_SELECTORS:
+            i += step
+            continue
+        return _is_emoji_codepoint(ch)
+    return False
+
+
+def _is_legitimate_emoji_zwj(content: str, index: int) -> bool:
+    """Return True when U+200D is joining two emoji codepoints.
+
+    Zero-width joiner is a real attack surface when hidden in ordinary text,
+    but it is also required for common emoji glyphs such as family/grouping
+    symbols.  Treat only emoji-adjacent ZWJ as benign; other invisible
+    characters and text-adjacent ZWJ remain findings.
+    """
+    return (
+        content[index] == "\u200d"
+        and _neighbor_emoji(content, index - 1, -1)
+        and _neighbor_emoji(content, index + 1, 1)
+    )
+
+
+def _invisible_unicode_findings(content: str) -> List[str]:
+    findings: List[str] = []
+    seen: set[str] = set()
+    for index, ch in enumerate(content):
+        if ch not in INVISIBLE_CHARS:
+            continue
+        if ch == "\u200d" and _is_legitimate_emoji_zwj(content, index):
+            continue
+        code = f"invisible_unicode_U+{ord(ch):04X}"
+        if code not in seen:
+            seen.add(code)
+            findings.append(code)
+    return findings
+
 
 # Compiled pattern sets, indexed by scope.  Compiled once at import time;
 # scan_for_threats() looks them up.
@@ -212,12 +264,7 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
 
     findings: List[str] = []
 
-    # Invisible unicode — single pass through the content set, not 17
-    # ``in`` lookups.
-    char_set = set(content)
-    invisible_hits = char_set & INVISIBLE_CHARS
-    for ch in invisible_hits:
-        findings.append(f"invisible_unicode_U+{ord(ch):04X}")
+    findings.extend(_invisible_unicode_findings(content))
 
     # Threat patterns
     patterns = _COMPILED.get(scope)

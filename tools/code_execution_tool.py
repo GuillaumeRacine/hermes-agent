@@ -1755,6 +1755,12 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         enabled_sandbox_tools = SANDBOX_ALLOWED_TOOLS
     if mode is None:
         mode = _get_execution_mode()
+    try:
+        _cfg = _load_config()
+    except Exception:
+        _cfg = {}
+    timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
+    max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
     # Build tool documentation lines for only the enabled tools
     tool_lines = "\n".join(
@@ -1795,7 +1801,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         "or the task requires interactive user input.\n\n"
         f"Available via `from hermes_tools import ...`:\n\n"
         f"{tool_lines}\n\n"
-        "Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per script. "
+        f"Limits: {timeout}s timeout, 50KB stdout cap, max {max_tool_calls} tool calls per script. "
         "terminal() is foreground-only (no background or pty).\n\n"
         f"{cwd_note}\n\n"
         "Print your final result to stdout. Use Python stdlib (json, re, math, csv, "

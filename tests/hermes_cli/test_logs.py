@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 from hermes_cli.logs import (
     LOG_FILES,
+    analyze_slow_turns,
     _extract_level,
     _extract_logger_name,
     _line_matches_component,
@@ -13,6 +14,7 @@ from hermes_cli.logs import (
     _parse_since,
     _read_last_n_lines,
     _read_tail,
+    render_slow_turn_report,
 )
 
 
@@ -261,3 +263,55 @@ class TestLogFiles:
         assert "errors" in LOG_FILES
         assert "gateway" in LOG_FILES
         assert "gui" in LOG_FILES
+
+
+# ---------------------------------------------------------------------------
+# Slow-turn diagnostics
+# ---------------------------------------------------------------------------
+
+class TestSlowTurnDiagnostics:
+    def test_analyze_slow_turns_joins_gateway_and_error_indicators(self):
+        gateway_lines = [
+            "2026-06-26 17:21:35,557 INFO gateway.run: inbound message: platform=slack user=U1 chat=C1 msg='Find deals'\n",
+            "2026-06-26 17:31:49,683 INFO gateway.run: response ready: platform=slack chat=C1 time=614.1s api_calls=3 response=2224 chars\n",
+        ]
+        error_lines = [
+            "2026-06-26 17:21:36,215 WARNING [20260626_172135_ad851ab6] agent.prompt_builder: Context file SOUL.md blocked: invisible_unicode_U+200D\n",
+            "2026-06-26 17:28:57,420 WARNING [20260626_172135_ad851ab6] tools.code_execution_tool: execute_code timed out after 300.12s (limit 300s) with 18 tool calls\n",
+            "2026-06-26 17:28:57,533 WARNING [20260626_172135_ad851ab6] agent.tool_executor: Tool execute_code returned error (303.37s): {}\n",
+        ]
+
+        report = analyze_slow_turns(gateway_lines, error_lines, threshold_s=300)
+
+        assert len(report.slow_turns) == 1
+        turn = report.slow_turns[0]
+        assert turn.platform == "slack"
+        assert turn.duration_s == 614.1
+        assert turn.api_calls == 3
+        assert "20260626_172135_ad851ab6" in turn.session_ids
+        assert any("SOUL blocked" in item for item in turn.indicators)
+        assert any("execute_code timeout 300.12s/300s" in item for item in turn.indicators)
+        assert any("execute_code error after 303.37s" in item for item in turn.indicators)
+
+    def test_analyze_slow_turns_tracks_socket_disconnects(self):
+        gateway_lines = [
+            "2026-06-24 19:54:21,877 WARNING gateway.platforms.slack: [Slack] Socket Mode unhealthy (transport disconnected); reconnecting\n",
+        ]
+
+        report = analyze_slow_turns(gateway_lines, [], threshold_s=300)
+
+        assert report.slow_turns == []
+        assert report.socket_disconnects == ["2026-06-24 19:54:21: transport disconnected"]
+
+    def test_render_slow_turn_report_is_compact(self):
+        gateway_lines = [
+            "2026-06-26 11:25:59,265 INFO gateway.run: inbound message: platform=slack user=U1 chat=C1 msg='Find Isabelle'\n",
+            "2026-06-26 11:33:00,781 INFO gateway.run: response ready: platform=slack chat=C1 time=421.5s api_calls=17 response=545 chars\n",
+        ]
+        report = analyze_slow_turns(gateway_lines, [], threshold_s=300)
+
+        rendered = render_slow_turn_report(report)
+
+        assert "Slow gateway turns >= 300s" in rendered
+        assert "421.5s api_calls=17" in rendered
+        assert "msg='Find Isabelle'" in rendered

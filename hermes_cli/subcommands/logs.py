@@ -34,13 +34,14 @@ Examples:
     hermes logs --since 1h         Lines from the last hour
     hermes logs --since 30m -f     Follow, starting from 30 min ago
     hermes logs list               List available log files with sizes
+    hermes logs slow-turns --threshold 300 --since 7d
 """,
     )
     logs_parser.add_argument(
         "log_name",
         nargs="?",
         default="agent",
-        help="Log to view: agent (default), errors, gateway, gui, or 'list' to show available files",
+        help="Log to view: agent (default), errors, gateway, gui, 'list', or 'slow-turns'",
     )
     logs_parser.add_argument(
         "-n",
@@ -74,5 +75,11 @@ Examples:
         "--component",
         metavar="NAME",
         help="Filter by component: gateway, agent, tools, cli, cron, gui",
+    )
+    logs_parser.add_argument(
+        "--threshold",
+        type=float,
+        default=300.0,
+        help="Slow-turn threshold in seconds for 'hermes logs slow-turns' (default: 300)",
     )
     logs_parser.set_defaults(func=cmd_logs)

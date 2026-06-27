@@ -11613,12 +11613,18 @@ def cmd_prompt_size(args):
 
 def cmd_logs(args):
     """View and filter Hermes log files."""
-    from hermes_cli.logs import tail_log, list_logs
+    from hermes_cli.logs import tail_log, list_logs, print_slow_turns
 
     log_name = getattr(args, "log_name", "agent") or "agent"
 
     if log_name == "list":
         list_logs()
+        return
+    if log_name == "slow-turns":
+        print_slow_turns(
+            threshold_s=getattr(args, "threshold", 300.0),
+            since=getattr(args, "since", None),
+        )
         return
 
     tail_log(

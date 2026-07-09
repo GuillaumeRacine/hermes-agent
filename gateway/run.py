@@ -341,7 +341,14 @@ def _gateway_provider_error_reply(text: str) -> str:
             "error out of chat; check gateway logs for details or try rephrasing."
         )
     if _GATEWAY_RATE_LIMIT_RE.search(text):
-        return "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."
+        return (
+            "⏱️ The model provider is rate-limited right now and no fallback "
+            "provider took over. Resend the message in ~1 minute — it usually "
+            "clears. If this keeps happening: (1) check the fallback chain is "
+            "configured as dicts (`fallback_providers: [{provider: ..., model: ...}]` "
+            "in config.yaml — bare strings are silently ignored), (2) raw error "
+            "details are in ~/.hermes/logs/errors.log."
+        )
     return (
         "⚠️ The model provider failed after retries. I kept raw provider details "
         "out of chat; check gateway logs for diagnostics."

@@ -633,6 +633,85 @@ class GatewaySlashCommandsMixin:
 
         return "\n".join(lines)
 
+    async def _handle_auth_command(self, event: MessageEvent) -> str:
+        """Check or recover provider credentials without exposing secrets."""
+        from gateway.auth_recovery import (
+            auth_status_summary,
+            open_auth_dashboard,
+            recovery_instructions,
+        )
+        from gateway.run import _hermes_home, _load_gateway_config
+
+        config = _load_gateway_config()
+        model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
+        configured_provider = (
+            str(model_cfg.get("provider") or "").strip()
+            if isinstance(model_cfg, dict)
+            else ""
+        )
+        typed_prefix = self._typed_command_prefix_for(event.source.platform)
+
+        try:
+            parts = shlex.split(event.get_command_args().strip())
+        except ValueError as exc:
+            return f"Invalid auth command: {exc}"
+
+        action = parts[0].lower() if parts else "status"
+        if action == "status":
+            provider = parts[1] if len(parts) > 1 else configured_provider
+            if not provider:
+                return f"Usage: {typed_prefix}auth status <provider>"
+            return auth_status_summary(provider, typed_prefix=typed_prefix)
+
+        if action == "open":
+            if len(parts) != 2:
+                return f"Usage: {typed_prefix}auth open <provider>"
+            provider = parts[1]
+            result = await asyncio.to_thread(open_auth_dashboard, provider)
+            if result.error:
+                return (
+                    f"⚠️ {result.error}.\n"
+                    f"Open manually on this Mac: {result.url}\n"
+                    + recovery_instructions(provider, typed_prefix=typed_prefix)
+                )
+            started = "started the local dashboard and " if result.dashboard_started else ""
+            return (
+                f"✅ I {started}opened the {provider} login in your browser.\n"
+                f"If the browser did not focus, open: {result.url}\n"
+                "After login completes, retry the original request."
+            )
+
+        if action == "refresh":
+            try:
+                from hermes_cli.env_loader import (
+                    load_hermes_dotenv,
+                    reset_secret_source_cache,
+                )
+
+                reset_secret_source_cache()
+                await asyncio.to_thread(
+                    load_hermes_dotenv,
+                    hermes_home=_hermes_home,
+                )
+                session_key = self._session_key_for_source(event.source)
+                self._evict_cached_agent(session_key)
+            except Exception as exc:
+                logger.warning("Explicit external-secret refresh failed: %s", exc)
+                return (
+                    "⚠️ Secret refresh failed. Unlock 1Password and retry, or run "
+                    "`hermes secrets onepassword sync` locally."
+                )
+            provider = parts[1] if len(parts) > 1 else configured_provider
+            if provider:
+                return (
+                    "External secret sources were refreshed for this Hermes process.\n"
+                    + auth_status_summary(provider, typed_prefix=typed_prefix)
+                )
+            return "External secret sources were refreshed for this Hermes process."
+
+        provider = parts[0]
+        return auth_status_summary(provider, typed_prefix=typed_prefix)
+
     @staticmethod
     def _redact_matrix_session_key(session_key: str) -> str:
         """Return a stable Matrix session-key fingerprint for shared room status."""

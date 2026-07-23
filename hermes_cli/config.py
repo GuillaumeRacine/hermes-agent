@@ -2938,6 +2938,23 @@ DEFAULT_CONFIG = {
             # `hermes secrets bitwarden setup`.
             "server_url": "",
         },
+        "onepassword": {
+            # Master switch. Hermes invokes the local `op` CLI only when this
+            # is true. Secret values are injected into the current process and
+            # are never written to Hermes files.
+            "enabled": False,
+            # Map environment variable names to 1Password secret references:
+            #   OPENAI_API_KEY: op://Hermes/OpenAI API/credential
+            "references": {},
+            # Optional 1Password account shorthand/sign-in address. Empty uses
+            # the CLI's active account.
+            "account": "",
+            # Empty searches PATH. Set an absolute path only when `op` is not
+            # discoverable in the gateway service environment.
+            "binary": "",
+            # Central rotation should normally replace stale .env/shell values.
+            "override_existing": True,
+        },
     },
 
     # Paste collapse thresholds (TUI + CLI).

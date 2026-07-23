@@ -12247,16 +12247,15 @@ def main():
     fallback_parser.set_defaults(func=cmd_fallback)
 
     # =========================================================================
-    # secrets command — external secret managers (currently: Bitwarden)
+    # secrets command — external secret managers
     # =========================================================================
     secrets_parser = subparsers.add_parser(
         "secrets",
-        help="Manage external secret sources (Bitwarden Secrets Manager)",
+        help="Manage external secret sources (1Password or Bitwarden)",
         description=(
             "Pull API keys from an external secret manager at process startup "
-            "instead of storing them in ~/.hermes/.env.  Currently supports "
-            "Bitwarden Secrets Manager.  See: "
-            "https://hermes-agent.nousresearch.com/docs/user-guide/secrets/bitwarden"
+            "instead of storing them in ~/.hermes/.env. Supports 1Password CLI "
+            "references and Bitwarden Secrets Manager."
         ),
     )
     secrets_subparsers = secrets_parser.add_subparsers(dest="secrets_command")
@@ -12272,10 +12271,22 @@ def main():
 
     _secrets_cli.register_cli(secrets_bw)
 
+    secrets_op = secrets_subparsers.add_parser(
+        "onepassword",
+        aliases=["1password", "op"],
+        help="1Password CLI integration using op:// references",
+    )
+    from hermes_cli import onepassword_secrets_cli as _onepassword_secrets_cli
+
+    _onepassword_secrets_cli.register_cli(secrets_op)
+
     def _dispatch_secrets(args):  # noqa: ANN001
         sub = getattr(args, "secrets_command", None)
         bw_sub = getattr(args, "secrets_bw_command", None)
+        op_sub = getattr(args, "secrets_op_command", None)
         if sub in ("bitwarden", "bw") and bw_sub is not None:
+            return args.func(args)
+        if sub in ("onepassword", "1password", "op") and op_sub is not None:
             return args.func(args)
         secrets_parser.print_help()
         return 0

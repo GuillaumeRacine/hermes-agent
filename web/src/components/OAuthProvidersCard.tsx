@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   ShieldCheck,
   ShieldOff,
@@ -50,6 +51,7 @@ function formatExpiresAt(
 }
 
 export function OAuthProvidersCard({ onError, onSuccess }: Props) {
+  const [searchParams, setSearchParams] = useSearchParams();
   const [providers, setProviders] = useState<OAuthProvider[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -59,20 +61,42 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
   const { t } = useI18n();
 
   const onErrorRef = useRef(onError);
-  onErrorRef.current = onError;
+  useEffect(() => {
+    onErrorRef.current = onError;
+  }, [onError]);
 
   const refresh = useCallback(() => {
     setLoading(true);
     api
       .getOAuthProviders()
-      .then((resp) => setProviders(resp.providers))
+      .then((resp) => {
+        setProviders(resp.providers);
+        const requestedId = new URLSearchParams(window.location.search).get(
+          "oauth",
+        );
+        const requested = resp.providers.find(
+          (provider) => provider.id === requestedId,
+        );
+        if (requested && requested.flow !== "external") {
+          setLoginFor(requested);
+        }
+      })
       .catch((e) => onErrorRef.current?.(`Failed to load providers: ${e}`))
       .finally(() => setLoading(false));
   }, []);
 
   useEffect(() => {
-    refresh();
+    const timer = window.setTimeout(refresh, 0);
+    return () => window.clearTimeout(timer);
   }, [refresh]);
+
+  const closeLogin = () => {
+    setLoginFor(null);
+    const next = new URLSearchParams(searchParams);
+    next.delete("oauth");
+    setSearchParams(next, { replace: true });
+    refresh();
+  };
 
   const handleDisconnect = async (provider: OAuthProvider) => {
     setBusyId(provider.id);
@@ -263,10 +287,7 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
       {loginFor && (
         <OAuthLoginModal
           provider={loginFor}
-          onClose={() => {
-            setLoginFor(null);
-            refresh();
-          }}
+          onClose={closeLogin}
           onSuccess={(msg) => onSuccess?.(msg)}
           onError={(msg) => onError?.(msg)}
         />

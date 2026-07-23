@@ -179,6 +179,7 @@ class CLIAgentSetupMixin:
         Processing / Anthropic fast mode, attach `request_overrides` so the
         API call is marked accordingly.
         """
+        from cli import logger
         from hermes_cli.models import resolve_fast_mode_overrides
 
         runtime = {
@@ -202,6 +203,21 @@ class CLIAgentSetupMixin:
                 tuple(runtime["args"]),
             ),
         }
+        try:
+            from hermes_cli.adaptive_routing import observe_shadow_route
+
+            route["adaptive_routing"] = observe_shadow_route(
+                user_message,
+                self.model,
+                str(self.provider or ""),
+                getattr(self, "config", {}) or {},
+            )
+        except Exception:
+            logger.debug(
+                "Adaptive route observation failed",
+                exc_info=True,
+            )
+            route["adaptive_routing"] = None
 
         service_tier = getattr(self, "service_tier", None)
         if not service_tier:

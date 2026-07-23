@@ -332,8 +332,10 @@ def _gateway_provider_error_reply(text: str) -> str:
     """Map raw provider/API errors to a short user-safe Telegram reply."""
     if _GATEWAY_AUTH_ERROR_RE.search(text):
         return (
-            "⚠️ Provider authentication failed. Check the configured credentials; "
-            "raw provider details are in the gateway logs."
+            "⚠️ Provider authentication failed; configured fallbacks were tried. "
+            "Use `!auth` in Slack (`/auth` elsewhere) for a secret-safe status "
+            "check and browser/1Password recovery instructions. Raw provider "
+            "details are in the gateway logs."
         )
     if _GATEWAY_PROVIDER_POLICY_RE.search(text):
         return (
@@ -3558,6 +3560,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 tuple(runtime["args"]),
             ),
         }
+        try:
+            from hermes_cli.adaptive_routing import observe_shadow_route
+            from hermes_cli.config import load_config
+
+            route["adaptive_routing"] = observe_shadow_route(
+                user_message,
+                model,
+                str(runtime["provider"] or ""),
+                load_config(),
+            )
+        except Exception:
+            logger.debug(
+                "Adaptive route observation failed",
+                exc_info=True,
+            )
+            route["adaptive_routing"] = None
 
         service_tier = getattr(self, "_service_tier", None)
         if not service_tier:
@@ -8644,6 +8662,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "model":
             return await self._handle_model_command(event)
+
+        if canonical == "auth":
+            return await self._handle_auth_command(event)
 
         if canonical == "codex-runtime":
             return await self._handle_codex_runtime_command(event)

@@ -129,6 +129,14 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True),
     CommandDef("model", "Switch model (persists by default)", "Configuration",
                args_hint="[model] [--provider name] [--global|--session] [--refresh]"),
+    CommandDef(
+        "auth",
+        "Check provider auth, refresh 1Password keys, or open browser login",
+        "Configuration",
+        args_hint="[provider | status [provider] | refresh | open <provider>]",
+        gateway_only=True,
+        subcommands=("status", "refresh", "open"),
+    ),
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",),
                args_hint="[auto|codex_app_server]"),
@@ -1158,7 +1166,12 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug"})
+#   - auth: recovery remains directly typeable as ``!auth`` in Slack threads;
+#     native slash users reach it through ``/hermes auth`` so it does not evict
+#     an existing command from Slack's 50-command manifest cap.
+_SLACK_VIA_HERMES_ONLY = frozenset(
+    {"credits", "billing", "moa", "debug", "auth"}
+)
 
 
 def _sanitize_slack_name(raw: str) -> str:

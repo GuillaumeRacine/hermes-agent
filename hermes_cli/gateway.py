@@ -2447,6 +2447,51 @@ def get_python_path() -> str:
     return sys.executable
 
 
+def _launchd_python_invocation() -> tuple[str, str]:
+    """Return a launchd-safe interpreter and optional ``PYTHONPATH`` overlay.
+
+    macOS launchd can reject ``posix_spawn`` with ``EPERM`` when the program
+    path traverses a symlinked parent onto an external volume (for example,
+    ``~/.hermes`` -> ``/Volumes/SSD/...``). Interactive execution of that same
+    venv interpreter works, which makes the failure look like a bad plist.
+
+    Keep normal local venv paths unchanged so Python retains native venv
+    semantics. For a path whose *parent* is remapped by a symlink, launch the
+    resolved base interpreter from its stable path and explicitly expose the
+    project plus venv site-packages. ``VIRTUAL_ENV`` remains set separately in
+    the generated plist, so Hermes still discovers the intended venv.
+    """
+    python_path = Path(get_python_path()).expanduser()
+    try:
+        lexical_parent = python_path.parent.absolute()
+        resolved_parent = lexical_parent.resolve()
+    except OSError:
+        return str(python_path), ""
+    if lexical_parent == resolved_parent:
+        return str(python_path), ""
+
+    try:
+        resolved_python = str(python_path.resolve(strict=True))
+    except OSError:
+        return str(python_path), ""
+
+    entries = [str(PROJECT_ROOT)]
+    venv = _detect_venv_dir()
+    if venv is not None:
+        site_packages = (
+            Path(venv)
+            / "lib"
+            / f"python{sys.version_info.major}.{sys.version_info.minor}"
+            / "site-packages"
+        )
+        if site_packages.is_dir():
+            entries.append(str(site_packages))
+    entries.extend(
+        value for value in os.environ.get("PYTHONPATH", "").split(os.pathsep) if value
+    )
+    return resolved_python, os.pathsep.join(dict.fromkeys(entries))
+
+
 # =============================================================================
 # Systemd (Linux)
 # =============================================================================
@@ -3616,13 +3661,20 @@ def _launchd_fallback_to_detached(reason: str, *, exit_on_failure: bool = True) 
 
 
 def generate_launchd_plist() -> str:
-    python_path = get_python_path()
-    # Stable cwd anchor — never the volatile source checkout. See
-    # _stable_service_working_dir() for the rationale (same rot risk applies
-    # to launchd's WorkingDirectory as to systemd's).
-    working_dir = _stable_service_working_dir()
+    python_path, pythonpath_overlay = _launchd_python_invocation()
+    # Use the real user home rather than HERMES_HOME. On macOS, launchd can
+    # reject posix_spawn with EPERM before Python starts when WorkingDirectory
+    # resolves onto an external volume, even though the same directory is
+    # accessible to the interactive user. The gateway never depends on cwd;
+    # HERMES_HOME and PYTHONPATH below provide the actual state/source roots.
+    working_dir = str(_launchd_user_home())
     hermes_home = str(get_hermes_home().resolve())
-    log_dir = get_hermes_home() / "logs"
+    # launchd opens stdout/stderr before spawning. Paths that traverse
+    # ~/.hermes onto an external volume can trigger the same EPERM as an
+    # external WorkingDirectory, so keep service-manager streams on the boot
+    # volume. Hermes' own logging still writes the canonical gateway.log under
+    # HERMES_HOME after Python starts.
+    log_dir = _launchd_user_home() / "Library" / "Logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     label = get_launchd_label()
     profile_arg = _profile_arg(hermes_home)
@@ -3645,6 +3697,12 @@ def generate_launchd_plist() -> str:
         dict.fromkeys(
             priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]
         )
+    )
+    pythonpath_xml = (
+        "\n        <key>PYTHONPATH</key>"
+        f"\n        <string>{pythonpath_overlay}</string>"
+        if pythonpath_overlay
+        else ""
     )
 
     # Build ProgramArguments array, including --profile when using a named profile
@@ -3687,7 +3745,7 @@ def generate_launchd_plist() -> str:
         <key>VIRTUAL_ENV</key>
         <string>{venv_dir}</string>
         <key>HERMES_HOME</key>
-        <string>{hermes_home}</string>
+        <string>{hermes_home}</string>{pythonpath_xml}
     </dict>
 
     <key>LimitLoadToSessionType</key>

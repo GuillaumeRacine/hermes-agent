@@ -3560,6 +3560,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 tuple(runtime["args"]),
             ),
         }
+        try:
+            from hermes_cli.adaptive_routing import observe_shadow_route
+            from hermes_cli.config import load_config
+
+            route["adaptive_routing"] = observe_shadow_route(
+                user_message,
+                model,
+                str(runtime["provider"] or ""),
+                load_config(),
+            )
+        except Exception:
+            logger.debug(
+                "Adaptive route observation failed",
+                exc_info=True,
+            )
+            route["adaptive_routing"] = None
 
         service_tier = getattr(self, "_service_tier", None)
         if not service_tier:

@@ -897,6 +897,22 @@ DEFAULT_CONFIG = {
     "providers": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
+    # Deterministic task classification and model-route observation.
+    # Shadow mode never changes the active provider/model. It records only
+    # non-content metadata so an external evaluator can compare recommended
+    # routes against the live route before any guarded promotion.
+    "adaptive_routing": {
+        "enabled": False,
+        "mode": "shadow",
+        "policy_path": "",
+        "telemetry_path": "~/.hermes/logs/adaptive-routing.jsonl",
+        "private_provider_allowlist": [
+            "local-ollama",
+            "openai-codex",
+            "xai-oauth",
+            "claude-code",
+        ],
+    },
     "toolsets": ["hermes-cli"],
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.

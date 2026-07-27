@@ -42,6 +42,21 @@ and verify the second pass.
 Release QA and allocation changes must still pass an independent Claude or
 Codex review.
 
+## Content-free outcome telemetry
+
+Every observed decision includes a random `decision_id`. After the turn,
+Hermes writes a correlated `route_outcome` with the actual provider/model,
+completion state, normalized failure kind, elapsed time, API/fallback counts,
+context size, input/output/cache/reasoning token-count deltas, and estimated
+cost delta. Classic CLI startup also emits `startup_ready` with
+process-to-input-ready latency.
+
+Prompts, responses, raw errors, session/account identifiers, access tokens, and
+credentials are never written. Live outcomes may trigger quarantine,
+availability fallback, or a fresh evaluation. They cannot populate a guarded
+`selected` route or bypass signed evaluation/canary evidence and independent
+Claude/Codex QA.
+
 Uninspected image, audio, or file attachments are conservatively private.
 Deterministic privacy detection also covers common credentials, email
 addresses, phone numbers, employee/payroll records, and account identifiers.
@@ -85,7 +100,7 @@ credential refresh re-admits the provider.
 
 The state file stores only provider/model identifiers, normalized reasons,
 counters, and timestamps. It never stores prompts, provider error bodies,
-tokens, credentials, or account identifiers.
+access tokens, credentials, or account identifiers.
 
 Quota exhaustion is not an authentication failure: Hermes does not
 automatically log in, replace secrets, purchase credits, or increase limits.

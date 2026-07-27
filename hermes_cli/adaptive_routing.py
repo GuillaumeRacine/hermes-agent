@@ -35,6 +35,45 @@ _PIN_LOCK = threading.Lock()
 _POLICY_ATTESTATION_PRODUCER = (
     "local-ai-router-evals/weekly_router_cycle.py:runtime-policy"
 )
+_OUTCOME_FAILURE_KINDS = {
+    "auth",
+    "auth_permanent",
+    "billing",
+    "interrupted",
+    "max_iterations",
+    "model_not_found",
+    "overloaded",
+    "partial",
+    "rate_limit",
+    "server_error",
+    "timeout",
+    "unknown",
+}
+_COST_STATUSES = {
+    "actual",
+    "estimated",
+    "included",
+    "unknown",
+}
+_USAGE_ATTRIBUTES = {
+    "input_tokens": "session_input_tokens",
+    "output_tokens": "session_output_tokens",
+    "cache_read_tokens": "session_cache_read_tokens",
+    "cache_write_tokens": "session_cache_write_tokens",
+    "reasoning_tokens": "session_reasoning_tokens",
+    "total_tokens": "session_total_tokens",
+    "api_calls": "session_api_calls",
+    "fallback_index": "_fallback_index",
+}
+_TELEMETRY_IDENTIFIER = re.compile(
+    r"^[A-Za-z0-9~][A-Za-z0-9._:/+@*~-]{0,199}$"
+)
+_ROUTE_IDENTIFIER_KEYS = {
+    "critic_model",
+    "critic_provider",
+    "model",
+    "provider",
+}
 
 try:  # pragma: no cover - Windows does not provide fcntl.
     import fcntl
@@ -805,6 +844,68 @@ def _fingerprint(message: str) -> str:
     ).hexdigest()[:16]
 
 
+def _append_telemetry_event(
+    telemetry_path: str | Path,
+    event: dict[str, Any],
+) -> None:
+    """Append one bounded, content-free telemetry event."""
+    path = Path(telemetry_path).expanduser()
+    try:
+        line = json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+        # Refuse accidental schema expansion instead of writing an unbounded
+        # row. These fixed-schema events never contain user/model content.
+        if len(line.encode("utf-8")) > 16 * 1024:
+            logger.warning("Adaptive routing telemetry event exceeded size limit")
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _WRITE_LOCK:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(line)
+    except (OSError, TypeError, ValueError):
+        logger.warning("Could not append adaptive routing telemetry: %s", path)
+
+
+def _safe_telemetry_identifier(value: Any) -> str:
+    candidate = str(value or "")
+    return candidate if _TELEMETRY_IDENTIFIER.fullmatch(candidate) else "redacted"
+
+
+def _sanitize_route_identifiers(value: Any, *, key: str = "") -> Any:
+    if key in _ROUTE_IDENTIFIER_KEYS:
+        return _safe_telemetry_identifier(value)
+    if key == "allowed_fallback_providers" and isinstance(value, list):
+        return [_safe_telemetry_identifier(item) for item in value[:100]]
+    if isinstance(value, dict):
+        return {
+            item_key: _sanitize_route_identifiers(item_value, key=item_key)
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_route_identifiers(item) for item in value[:100]]
+    return value
+
+
+def _safe_nonnegative_int(value: Any, *, maximum: int = 10**12) -> int:
+    try:
+        return max(0, min(maximum, int(value or 0)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _safe_nonnegative_float(
+    value: Any,
+    *,
+    maximum: float = 10**6,
+) -> float:
+    try:
+        numeric = float(value or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if not 0.0 <= numeric <= maximum:
+        return 0.0
+    return numeric
+
+
 def record_shadow_decision(
     decision: dict[str, Any],
     message: str,
@@ -813,19 +914,191 @@ def record_shadow_decision(
     """Append only non-content routing metadata; failures never break a turn."""
     if not decision:
         return
-    path = Path(telemetry_path).expanduser()
-    event = dict(decision)
+    event = _sanitize_route_identifiers(dict(decision))
     event["event"] = "route_decision"
     event["created_at"] = datetime.now(timezone.utc).isoformat()
     event["prompt_fingerprint"] = _fingerprint(message)
+    _append_telemetry_event(telemetry_path, event)
+
+
+def capture_route_usage(agent: Any) -> dict[str, int | float | str]:
+    """Snapshot cumulative counters so a caller can later emit turn deltas."""
+    snapshot: dict[str, int | float | str] = {}
+    for key, attribute in _USAGE_ATTRIBUTES.items():
+        snapshot[key] = _safe_nonnegative_int(
+            getattr(agent, attribute, 0),
+            maximum=10**12,
+        )
+    snapshot["estimated_cost_usd"] = _safe_nonnegative_float(
+        getattr(agent, "session_estimated_cost_usd", 0.0),
+    )
+    cost_status = str(
+        getattr(agent, "session_cost_status", "unknown") or "unknown"
+    ).lower()
+    snapshot["cost_status"] = (
+        cost_status if cost_status in _COST_STATUSES else "unknown"
+    )
+    return snapshot
+
+
+def _outcome_status(result: dict[str, Any]) -> str:
+    if result.get("interrupted"):
+        return "interrupted"
+    if result.get("failed"):
+        return "failed"
+    if result.get("partial"):
+        return "partial"
+    if result.get("completed") is True:
+        return "completed"
+    return "incomplete"
+
+
+def _outcome_failure_kind(
+    result: dict[str, Any],
+    status: str,
+) -> str | None:
+    if status == "completed":
+        return None
+    candidate = str(result.get("failure_reason") or "").strip().lower()
+    if candidate in _OUTCOME_FAILURE_KINDS:
+        return candidate
+    exit_reason = str(result.get("turn_exit_reason") or "").strip().lower()
+    if exit_reason.startswith("max_iterations"):
+        return "max_iterations"
+    if status in {"interrupted", "partial"}:
+        return status
+    return "unknown"
+
+
+def record_route_outcome(
+    decision: dict[str, Any] | None,
+    result: dict[str, Any] | None,
+    agent: Any,
+    config: dict[str, Any],
+    *,
+    usage_before: dict[str, int | float | str] | None,
+    started_monotonic: float,
+    surface: str,
+) -> None:
+    """Record a content-free result correlated to one route decision."""
+    decision_id = str((decision or {}).get("decision_id") or "")
+    if not re.fullmatch(r"[0-9a-f]{24}", decision_id):
+        return
+    routing = config.get("adaptive_routing") or {}
+    if not routing.get("enabled"):
+        return
+    outcome = result if isinstance(result, dict) else {}
+    before = usage_before or {}
+    after = capture_route_usage(agent)
+    tokens = {}
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+        "total_tokens",
+    ):
+        tokens[key] = max(
+            0,
+            _safe_nonnegative_int(after.get(key, 0))
+            - _safe_nonnegative_int(before.get(key, 0)),
+        )
+    status = _outcome_status(outcome)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
-        with _WRITE_LOCK:
-            with open(path, "a", encoding="utf-8") as handle:
-                handle.write(line)
-    except OSError:
-        logger.warning("Could not append adaptive routing telemetry: %s", path)
+        elapsed_ms = max(
+            0,
+            min(
+                7 * 24 * 60 * 60 * 1000,
+                int((time.monotonic() - float(started_monotonic)) * 1000),
+            ),
+        )
+    except (TypeError, ValueError, OverflowError):
+        elapsed_ms = 0
+    context_tokens = _safe_nonnegative_int(
+        outcome.get("last_prompt_tokens"),
+    )
+    cost_delta = max(
+        0.0,
+        _safe_nonnegative_float(after.get("estimated_cost_usd", 0.0))
+        - _safe_nonnegative_float(before.get("estimated_cost_usd", 0.0)),
+    )
+    event = {
+        "event": "route_outcome",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "decision_id": decision_id,
+        "class": (decision or {}).get("class"),
+        "surface": _safe_telemetry_identifier(surface),
+        "actual": {
+            "provider": _safe_telemetry_identifier(
+                getattr(agent, "provider", "")
+            ),
+            "model": _safe_telemetry_identifier(getattr(agent, "model", "")),
+        },
+        "status": status,
+        "failure_kind": _outcome_failure_kind(outcome, status),
+        "latency_ms": elapsed_ms,
+        "api_calls": _safe_nonnegative_int(
+            outcome.get("api_calls"),
+            maximum=10000,
+        ),
+        "fallback_count": max(
+            0,
+            _safe_nonnegative_int(
+                after.get("fallback_index", 0),
+                maximum=10000,
+            )
+            - _safe_nonnegative_int(
+                before.get("fallback_index", 0),
+                maximum=10000,
+            ),
+        ),
+        "context_tokens": context_tokens,
+        "tokens": tokens,
+        "estimated_cost_usd": round(cost_delta, 10),
+        "cost_status": str(after.get("cost_status") or "unknown"),
+    }
+    _append_telemetry_event(
+        routing.get("telemetry_path")
+        or "~/.hermes/logs/adaptive-routing.jsonl",
+        event,
+    )
+
+
+def record_startup_ready(
+    config: dict[str, Any],
+    *,
+    started_monotonic: float,
+    surface: str,
+    deferred: bool,
+    safe_mode: bool,
+) -> None:
+    """Record process-to-input-ready latency without user/session content."""
+    routing = config.get("adaptive_routing") or {}
+    if not routing.get("enabled"):
+        return
+    try:
+        latency_ms = max(
+            0,
+            min(
+                60 * 60 * 1000,
+                int((time.monotonic() - float(started_monotonic)) * 1000),
+            ),
+        )
+    except (TypeError, ValueError, OverflowError):
+        return
+    _append_telemetry_event(
+        routing.get("telemetry_path")
+        or "~/.hermes/logs/adaptive-routing.jsonl",
+        {
+            "event": "startup_ready",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "surface": _safe_telemetry_identifier(surface),
+            "latency_ms": latency_ms,
+            "deferred": bool(deferred),
+            "safe_mode": bool(safe_mode),
+        },
+    )
 
 
 def observe_shadow_route(
@@ -844,6 +1117,8 @@ def observe_shadow_route(
         assume_private=assume_private,
     )
     if decision:
+        decision = dict(decision)
+        decision["decision_id"] = secrets.token_hex(12)
         routing = config.get("adaptive_routing") or {}
         record_shadow_decision(
             decision,

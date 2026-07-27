@@ -11540,6 +11540,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if not self._ensure_runtime_credentials():
             return None
 
+        _route_started_monotonic = time.monotonic()
         turn_route = self._resolve_turn_agent_config(message)
         if turn_route["signature"] != self._active_agent_route_signature:
             self.agent = None
@@ -11553,6 +11554,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             request_overrides=turn_route.get("request_overrides"),
         ):
             return None
+        try:
+            from hermes_cli.adaptive_routing import capture_route_usage
+
+            _route_usage_before = capture_route_usage(self.agent)
+        except Exception:
+            _route_usage_before = {}
         
         # Route image attachments based on the active model's vision capability.
         # "native" → pass pixels as OpenAI-style content parts (adapters
@@ -11922,6 +11929,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             # Record when this agent loop finished so the status bar can show
             # idle time since the last final response.
             self._last_turn_finished_at = time.time()
+
+            try:
+                from hermes_cli.adaptive_routing import record_route_outcome
+
+                record_route_outcome(
+                    turn_route.get("adaptive_routing"),
+                    result,
+                    self.agent,
+                    self.config,
+                    usage_before=_route_usage_before,
+                    started_monotonic=_route_started_monotonic,
+                    surface="cli",
+                )
+            except Exception:
+                logger.debug(
+                    "Adaptive route outcome recording failed",
+                    exc_info=True,
+                )
 
             # Proactively clean up async clients whose event loop is dead.
             # The agent thread may have created AsyncOpenAI clients bound
@@ -14904,6 +14929,38 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 _mark_tui_input_modes_active()
                 # Drive the petdex mascot animation (no-op when no pet enabled).
                 self._pet_start_anim()
+                def _record_cli_startup_ready(_rendered_app):
+                    # A one-shot after-render callback measures the point at
+                    # which the input field has actually been painted.
+                    try:
+                        _rendered_app.after_render.remove_handler(
+                            _record_cli_startup_ready
+                        )
+                    except ValueError:
+                        pass
+                    try:
+                        from hermes_cli.adaptive_routing import record_startup_ready
+                        from hermes_cli.main import _PROCESS_STARTED_MONOTONIC
+
+                        record_startup_ready(
+                            self.config,
+                            started_monotonic=_PROCESS_STARTED_MONOTONIC,
+                            surface="classic_cli",
+                            deferred=(
+                                os.environ.get("HERMES_DEFER_AGENT_STARTUP")
+                                == "1"
+                            ),
+                            safe_mode=(
+                                os.environ.get("HERMES_SAFE_MODE") == "1"
+                            ),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "CLI startup telemetry recording failed",
+                            exc_info=True,
+                        )
+
+                app.after_render.add_handler(_record_cli_startup_ready)
                 app.run()
         except (EOFError, KeyboardInterrupt, BrokenPipeError):
             pass
@@ -15492,6 +15549,7 @@ def main(
                                 single_query_images,
                                 announce=False,
                             )
+                    _route_started_monotonic = time.monotonic()
                     turn_route = cli._resolve_turn_agent_config(effective_query)
                     if turn_route["signature"] != cli._active_agent_route_signature:
                         cli.agent = None
@@ -15500,6 +15558,14 @@ def main(
                         runtime_override=turn_route["runtime"],
                         request_overrides=turn_route.get("request_overrides"),
                     ):
+                        try:
+                            from hermes_cli.adaptive_routing import (
+                                capture_route_usage,
+                            )
+
+                            _route_usage_before = capture_route_usage(cli.agent)
+                        except Exception:
+                            _route_usage_before = {}
                         cli.agent.quiet_mode = True
                         cli.agent.suppress_status_output = True
                         # Suppress streaming display callbacks so stdout stays
@@ -15512,6 +15578,25 @@ def main(
                                 user_message=effective_query,
                                 conversation_history=cli.conversation_history,
                             )
+                            try:
+                                from hermes_cli.adaptive_routing import (
+                                    record_route_outcome,
+                                )
+
+                                record_route_outcome(
+                                    turn_route.get("adaptive_routing"),
+                                    result,
+                                    cli.agent,
+                                    cli.config,
+                                    usage_before=_route_usage_before,
+                                    started_monotonic=_route_started_monotonic,
+                                    surface="cli_query",
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "Adaptive route outcome recording failed",
+                                    exc_info=True,
+                                )
                         except KeyboardInterrupt:
                             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
                             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)

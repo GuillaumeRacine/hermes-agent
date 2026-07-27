@@ -63,6 +63,10 @@ except ModuleNotFoundError:
 
 import os
 import sys
+import time as _process_time
+
+
+_PROCESS_STARTED_MONOTONIC = _process_time.monotonic()
 
 
 def _set_process_title() -> None:

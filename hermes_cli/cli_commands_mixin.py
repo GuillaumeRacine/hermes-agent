@@ -15,6 +15,7 @@ Import discipline (mirrors gateway/slash_commands.py, PR #41886):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import threading
@@ -33,6 +34,8 @@ from hermes_cli.browser_connect import (
     is_browser_debug_ready,
     manual_chrome_debug_command,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class CLICommandsMixin:
@@ -1568,6 +1571,7 @@ class CLICommandsMixin:
         _cprint(f"  Task ID: {task_id}")
         _cprint("  You can continue chatting — results will appear when done.\n")
 
+        _route_started_monotonic = time.monotonic()
         turn_route = self._resolve_turn_agent_config(prompt)
 
         def run_background():
@@ -1618,10 +1622,33 @@ class CLICommandsMixin:
 
                 bg_agent.thinking_callback = _bg_thinking
 
+                try:
+                    from hermes_cli.adaptive_routing import capture_route_usage
+
+                    _route_usage_before = capture_route_usage(bg_agent)
+                except Exception:
+                    _route_usage_before = {}
                 result = bg_agent.run_conversation(
                     user_message=prompt,
                     task_id=task_id,
                 )
+                try:
+                    from hermes_cli.adaptive_routing import record_route_outcome
+
+                    record_route_outcome(
+                        turn_route.get("adaptive_routing"),
+                        result,
+                        bg_agent,
+                        self.config,
+                        usage_before=_route_usage_before,
+                        started_monotonic=_route_started_monotonic,
+                        surface="cli_background",
+                    )
+                except Exception:
+                    logger.debug(
+                        "Adaptive route outcome recording failed",
+                        exc_info=True,
+                    )
 
                 response = result.get("final_response", "") if result else ""
                 if not response and result and result.get("error"):

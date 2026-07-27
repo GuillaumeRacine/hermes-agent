@@ -11928,6 +11928,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reasoning_config = self._resolve_session_reasoning_config(source=source)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
+            _route_started_monotonic = time.monotonic()
             turn_route = self._resolve_turn_agent_config(
                 prompt,
                 model,
@@ -12015,10 +12016,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if isinstance(getattr(agent, "_primary_runtime", None), dict):
                     agent._primary_runtime["circuit_provider"] = circuit_provider
                 try:
-                    return agent.run_conversation(
+                    try:
+                        from hermes_cli.adaptive_routing import (
+                            capture_route_usage,
+                        )
+
+                        _route_usage_before = capture_route_usage(agent)
+                    except Exception:
+                        _route_usage_before = {}
+                    result = agent.run_conversation(
                         user_message=enriched_prompt,
                         task_id=task_id,
                     )
+                    try:
+                        from hermes_cli.adaptive_routing import (
+                            record_route_outcome,
+                        )
+
+                        record_route_outcome(
+                            turn_route.get("adaptive_routing"),
+                            result,
+                            agent,
+                            user_config,
+                            usage_before=_route_usage_before,
+                            started_monotonic=_route_started_monotonic,
+                            surface="gateway_background",
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Adaptive route outcome recording failed",
+                            exc_info=True,
+                        )
+                    return result
                 finally:
                     self._cleanup_agent_resources(agent)
 
@@ -16238,6 +16267,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_message="interim_assistant_callback scheduling error",
                 )
 
+            _route_started_monotonic = time.monotonic()
             turn_route = self._resolve_turn_agent_config(
                 message,
                 model,
@@ -16897,7 +16927,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                try:
+                    from hermes_cli.adaptive_routing import capture_route_usage
+
+                    _route_usage_before = capture_route_usage(agent)
+                except Exception:
+                    _route_usage_before = {}
+                result = agent.run_conversation(
+                    _api_run_message,
+                    **_conversation_kwargs,
+                )
+                try:
+                    from hermes_cli.adaptive_routing import record_route_outcome
+
+                    record_route_outcome(
+                        turn_route.get("adaptive_routing"),
+                        result,
+                        agent,
+                        user_config,
+                        usage_before=_route_usage_before,
+                        started_monotonic=_route_started_monotonic,
+                        surface="gateway",
+                    )
+                except Exception:
+                    logger.debug(
+                        "Adaptive route outcome recording failed",
+                        exc_info=True,
+                    )
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent

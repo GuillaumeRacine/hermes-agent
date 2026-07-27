@@ -929,7 +929,7 @@ def _mark_tui_input_modes_active() -> None:
 
 
 def _prepare_deferred_agent_startup() -> None:
-    """Run Termux-deferred agent discovery before the first real agent turn."""
+    """Run prompt-first deferred discovery before the first real agent turn."""
     global _deferred_agent_startup_done
     if _deferred_agent_startup_done:
         return
@@ -942,6 +942,15 @@ def _prepare_deferred_agent_startup() -> None:
         "yes",
         "on",
     }
+    try:
+        from hermes_cli.main import _sync_bundled_skills_for_startup
+
+        _sync_bundled_skills_for_startup()
+    except Exception:
+        logger.debug(
+            "bundled-skill sync failed at deferred CLI startup",
+            exc_info=True,
+        )
     try:
         from hermes_cli.plugins import discover_plugins
 
@@ -956,7 +965,7 @@ def _prepare_deferred_agent_startup() -> None:
 
         start_background_mcp_discovery(
             logger=logger,
-            thread_name="termux-cli-mcp-discovery",
+            thread_name="deferred-cli-mcp-discovery",
         )
     except Exception:
         logger.debug(

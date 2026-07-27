@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import secrets
+import stat
 import threading
 import time
 from contextlib import contextmanager
@@ -31,6 +32,9 @@ logger = logging.getLogger(__name__)
 _PROCESS_FINGERPRINT_KEY = secrets.token_bytes(32)
 _WRITE_LOCK = threading.Lock()
 _PIN_LOCK = threading.Lock()
+_POLICY_ATTESTATION_PRODUCER = (
+    "local-ai-router-evals/weekly_router_cycle.py:runtime-policy"
+)
 
 try:  # pragma: no cover - Windows does not provide fcntl.
     import fcntl
@@ -114,6 +118,44 @@ def _matches(text: str, patterns: tuple[str, ...]) -> list[str]:
     return [pattern for pattern in patterns if re.search(pattern, text)]
 
 
+def _policy_attestation_valid(payload: dict[str, Any]) -> bool:
+    attestation = payload.get("evidence_attestation")
+    if (
+        not isinstance(attestation, dict)
+        or attestation.get("schema_version") != 1
+        or attestation.get("algorithm") != "hmac-sha256"
+        or attestation.get("producer") != _POLICY_ATTESTATION_PRODUCER
+        or not isinstance(attestation.get("signature"), str)
+    ):
+        return False
+    key_path = Path(
+        os.environ.get("HERMES_ROUTER_EVIDENCE_KEY_PATH")
+        or "~/.hermes/state/model-router/evidence-signing.key"
+    ).expanduser()
+    try:
+        metadata = key_path.stat()
+        if metadata.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+            return False
+        key = key_path.read_bytes()
+    except OSError:
+        return False
+    if len(key) < 32:
+        return False
+    unsigned = dict(payload)
+    unsigned.pop("evidence_attestation", None)
+    canonical = json.dumps(
+        unsigned,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    domain = (
+        "hermes-router-evidence-v1\0hmac-sha256\0"
+        f"{_POLICY_ATTESTATION_PRODUCER}\0"
+    ).encode("utf-8")
+    expected = hmac.new(key, domain + canonical, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(attestation["signature"], expected)
+
+
 def classify_task(
     message: str,
     *,
@@ -175,10 +217,19 @@ def load_policy(
     except (OSError, ValueError):
         logger.warning("Adaptive routing policy is unreadable: %s", policy_path)
         return None
-    if payload.get("mode") != "shadow" or not isinstance(payload.get("classes"), dict):
+    if (
+        not isinstance(payload, dict)
+        or payload.get("mode") != "shadow"
+        or not isinstance(payload.get("classes"), dict)
+    ):
         logger.warning("Adaptive routing policy is not a supported shadow policy: %s", policy_path)
         return None
     if maximum_age_seconds is not None:
+        if not _policy_attestation_valid(payload):
+            logger.warning(
+                "Guarded routing policy has no valid runtime-policy attestation"
+            )
+            return None
         generated = payload.get("generated_at") or payload.get("created_at")
         try:
             generated_at = datetime.fromisoformat(

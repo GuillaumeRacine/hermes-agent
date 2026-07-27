@@ -30,7 +30,10 @@ adaptive_routing:
 Guarded selection fails closed to the configured model when the policy is
 missing/malformed, `selected` is null, the runtime is an external worker, the
 privacy boundary is violated, credentials cannot resolve, or the selected
-provider/model has an open circuit. A private task is blocked entirely if
+provider/model has an open circuit. Guarded policies must also carry a valid
+HMAC attestation from the router using the protected
+`~/.hermes/state/model-router/evidence-signing.key`; unsigned, modified, or
+permission-unsafe policy evidence is rejected. A private task is blocked entirely if
 neither the selected route nor configured primary is allowlisted, and its
 fallback chain is filtered to the same boundary. Guarded C4 activation is
 intentionally blocked in the current runtime path even when a

@@ -1,6 +1,12 @@
+import hashlib
+import hmac
 import json
+import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from hermes_cli.adaptive_routing import (
     apply_guarded_route,
@@ -8,9 +14,47 @@ from hermes_cli.adaptive_routing import (
     decide_route,
     decide_shadow_route,
     filter_fallbacks_for_decision,
+    load_policy,
     observe_shadow_route,
 )
 from hermes_cli.provider_circuits import record_failure
+
+_POLICY_PRODUCER = "local-ai-router-evals/weekly_router_cycle.py:runtime-policy"
+
+
+@pytest.fixture(autouse=True)
+def _router_policy_key(tmp_path, monkeypatch):
+    key_path = tmp_path / "router-policy.key"
+    key_path.write_bytes(b"test-router-policy-key-material!!")
+    key_path.chmod(0o600)
+    monkeypatch.setenv("HERMES_ROUTER_EVIDENCE_KEY_PATH", str(key_path))
+
+
+def _write_signed_policy(path, policy):
+    unsigned = dict(policy)
+    unsigned.pop("evidence_attestation", None)
+    canonical = json.dumps(
+        unsigned,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    domain = (
+        "hermes-router-evidence-v1\0hmac-sha256\0"
+        f"{_POLICY_PRODUCER}\0"
+    ).encode("utf-8")
+    key = Path(os.environ["HERMES_ROUTER_EVIDENCE_KEY_PATH"]).read_bytes()
+    signed = dict(unsigned)
+    signed["evidence_attestation"] = {
+        "schema_version": 1,
+        "algorithm": "hmac-sha256",
+        "producer": _POLICY_PRODUCER,
+        "signature": hmac.new(
+            key,
+            domain + canonical,
+            hashlib.sha256,
+        ).hexdigest(),
+    }
+    path.write_text(json.dumps(signed), encoding="utf-8")
 
 
 def _policy(path, provider="local-ollama", model="llama3.2:3b"):
@@ -188,7 +232,7 @@ def test_guarded_mode_uses_only_selected_native_route(tmp_path):
         },
     }
     policy_path = tmp_path / "policy.json"
-    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    _write_signed_policy(policy_path, policy)
     config = {
         "adaptive_routing": {
             "enabled": True,
@@ -230,6 +274,31 @@ def test_guarded_mode_uses_only_selected_native_route(tmp_path):
     assert guarded["runtime"]["provider"] == "local-ollama"
 
 
+def test_guarded_policy_requires_valid_attestation(tmp_path):
+    policy_path = tmp_path / "policy.json"
+    policy = {
+        "mode": "shadow",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "classes": {},
+    }
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    assert load_policy(policy_path, maximum_age_seconds=3600) is None
+
+    _write_signed_policy(policy_path, policy)
+    assert load_policy(policy_path, maximum_age_seconds=3600) is not None
+
+    tampered = json.loads(policy_path.read_text())
+    tampered["classes"]["C1"] = {"status": "candidate"}
+    policy_path.write_text(json.dumps(tampered), encoding="utf-8")
+    assert load_policy(policy_path, maximum_age_seconds=3600) is None
+
+
+def test_policy_with_non_object_root_fails_closed(tmp_path):
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text("[]", encoding="utf-8")
+    assert load_policy(policy_path, maximum_age_seconds=3600) is None
+
+
 def test_guarded_mode_holds_external_worker_and_c4_without_critic(tmp_path):
     policy = {
         "mode": "shadow",
@@ -251,7 +320,7 @@ def test_guarded_mode_holds_external_worker_and_c4_without_critic(tmp_path):
         },
     }
     policy_path = tmp_path / "policy.json"
-    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    _write_signed_policy(policy_path, policy)
     decision = decide_route(
         "deploy this to production",
         "grok",
@@ -296,7 +365,7 @@ def test_guarded_mode_rejects_stale_policy(tmp_path):
         },
     }
     policy_path = tmp_path / "policy.json"
-    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    _write_signed_policy(policy_path, policy)
     decision = decide_route(
         "summarize this",
         "grok",
@@ -332,7 +401,7 @@ def test_selected_current_route_is_still_pinned(tmp_path):
         },
     }
     policy_path = tmp_path / "policy.json"
-    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    _write_signed_policy(policy_path, policy)
     config = {
         "adaptive_routing": {
             "enabled": True,
@@ -385,7 +454,7 @@ def test_c4_blocks_when_different_provider_critic_circuit_is_open(tmp_path):
         },
     }
     policy_path = tmp_path / "policy.json"
-    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    _write_signed_policy(policy_path, policy)
     decision = decide_route(
         "deploy this to production",
         "grok",

@@ -847,6 +847,7 @@ def _resolve_named_custom_runtime(
         ) or "no-key-required"
         return {
             "provider": "custom",
+            "circuit_provider": requested_provider or "custom",
             "api_mode": _detect_api_mode_for_url(base_url) or "chat_completions",
             "base_url": base_url,
             "api_key": api_key,
@@ -881,6 +882,9 @@ def _resolve_named_custom_runtime(
                 **dict(pool_result.get("request_overrides") or {}),
                 **request_overrides,
             }
+        pool_result["circuit_provider"] = str(
+            custom_provider.get("name") or requested_provider
+        )
         return pool_result
 
     _cp_is_openai_url   = base_url_host_matches(base_url, "openai.com") or base_url_host_matches(base_url, "openai.azure.com")
@@ -901,6 +905,7 @@ def _resolve_named_custom_runtime(
 
     result = {
         "provider": "custom",
+        "circuit_provider": str(custom_provider.get("name") or requested_provider),
         "api_mode": custom_provider.get("api_mode")
         or _detect_api_mode_for_url(base_url)
         or "chat_completions",

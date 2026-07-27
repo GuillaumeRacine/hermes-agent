@@ -78,6 +78,15 @@ class CLIAgentSetupMixin:
         api_key = runtime.get("api_key")
         base_url = runtime.get("base_url")
         resolved_provider = runtime.get("provider", "openrouter")
+        resolved_circuit_provider = str(
+            runtime.get("circuit_provider")
+            or (
+                self.requested_provider
+                if resolved_provider == "custom"
+                else resolved_provider
+            )
+            or resolved_provider
+        )
         resolved_api_mode = runtime.get("api_mode", self.api_mode)
         resolved_acp_command = runtime.get("command")
         resolved_acp_args = list(runtime.get("args") or [])
@@ -119,6 +128,7 @@ class CLIAgentSetupMixin:
             or resolved_acp_args != self.acp_args
         )
         self.provider = resolved_provider
+        self._circuit_provider = resolved_circuit_provider
         self.api_mode = resolved_api_mode
         self.acp_command = resolved_acp_command
         self.acp_args = resolved_acp_args
@@ -190,6 +200,11 @@ class CLIAgentSetupMixin:
             "command": self.acp_command,
             "args": list(self.acp_args or []),
             "credential_pool": getattr(self, "_credential_pool", None),
+            "circuit_provider": getattr(
+                self,
+                "_circuit_provider",
+                self.provider,
+            ),
         }
         route = {
             "model": self.model,
@@ -206,12 +221,16 @@ class CLIAgentSetupMixin:
         try:
             from hermes_cli.adaptive_routing import observe_shadow_route
 
+            _routing_config = getattr(self, "config", {}) or {}
             route["adaptive_routing"] = observe_shadow_route(
                 user_message,
                 self.model,
                 str(self.provider or ""),
-                getattr(self, "config", {}) or {},
+                _routing_config,
             )
+            # Foreground CLI conversations remain pinned to their configured
+            # runtime. Guarded activation is limited to explicitly isolated,
+            # task-keyed background epochs in the gateway.
         except Exception:
             logger.debug(
                 "Adaptive route observation failed",
@@ -407,6 +426,18 @@ class CLIAgentSetupMixin:
                 notice_callback=self._on_notice,
                 notice_clear_callback=self._on_notice_clear,
             )
+            self.agent._circuit_provider = str(
+                runtime.get("circuit_provider")
+                or runtime.get("provider")
+                or ""
+            )
+            if isinstance(
+                getattr(self.agent, "_primary_runtime", None),
+                dict,
+            ):
+                self.agent._primary_runtime["circuit_provider"] = (
+                    self.agent._circuit_provider
+                )
             # Store reference for atexit memory provider shutdown.
             # NOTE: this MUST write to the ``cli`` module's global, not a
             # local module global. ``_run_cleanup`` (in cli.py) reads

@@ -109,6 +109,24 @@ def _api_key_default_label(count: int) -> str:
     return f"api-key-{count}"
 
 
+def _clear_provider_auth_circuit(provider: str) -> None:
+    """Re-admit a provider after an explicit credential add/login succeeds."""
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.provider_circuits import record_success
+
+        config = load_config()
+        record_success(
+            provider,
+            "*",
+            config=config,
+            force=True,
+            reasons={"auth", "auth_permanent"},
+        )
+    except Exception:
+        pass
+
+
 def _display_source(source: str) -> str:
     return source.split(":", 1)[1] if source.startswith("manual:") else source
 
@@ -218,6 +236,7 @@ def auth_add_command(args) -> None:
             base_url=_provider_base_url(provider),
         )
         pool.add_entry(entry)
+        _clear_provider_auth_circuit(provider)
         print(f'Added {provider} credential #{len(pool.entries())}: "{label}"')
         return
 
@@ -244,6 +263,7 @@ def auth_add_command(args) -> None:
             base_url=_provider_base_url(provider),
         )
         pool.add_entry(entry)
+        _clear_provider_auth_circuit(provider)
         print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
         return
 
@@ -280,6 +300,7 @@ def auth_add_command(args) -> None:
                     shown_label = entry.label if entry is not None else label_from_token(
                         rehydrated.get("access_token", ""), _oauth_default_label(provider, 1),
                     )
+                    _clear_provider_auth_circuit(provider)
                     print(f'Imported {provider} OAuth credentials: "{shown_label}"')
                     return
                 # Rehydrate failed (expired refresh_token, portal down, etc.)
@@ -304,6 +325,7 @@ def auth_add_command(args) -> None:
         shown_label = entry.label if entry is not None else label_from_token(
             creds.get("access_token", ""), _oauth_default_label(provider, 1),
         )
+        _clear_provider_auth_circuit(provider)
         print(f'Saved {provider} OAuth device-code credentials: "{shown_label}"')
         return
 
@@ -341,6 +363,7 @@ def auth_add_command(args) -> None:
         # _save_provider_state). Subsequent adds leave the active provider as-is.
         if first_credential:
             auth_mod.mark_provider_active_if_unset(provider)
+        _clear_provider_auth_circuit(provider)
         print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
         return
 
@@ -361,6 +384,7 @@ def auth_add_command(args) -> None:
         shown_label = entry.label if entry is not None else label_from_token(
             creds["tokens"]["access_token"], _oauth_default_label(provider, 1)
         )
+        _clear_provider_auth_circuit(provider)
         print(f'Saved {provider} OAuth credentials: "{shown_label}"')
         return
 
@@ -382,6 +406,7 @@ def auth_add_command(args) -> None:
             base_url=creds.get("base_url"),
         )
         pool.add_entry(entry)
+        _clear_provider_auth_circuit(provider)
         print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
         return
 
@@ -406,6 +431,7 @@ def auth_add_command(args) -> None:
             base_url=creds.get("inference_base_url"),
         )
         pool.add_entry(entry)
+        _clear_provider_auth_circuit(provider)
         print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
         return
 

@@ -1324,6 +1324,9 @@ def run_conversation(
                     # Invalid response — could be rate limiting, provider timeout,
                     # upstream server error, or malformed response.
                     retry_count += 1
+                    from agent.chat_completion_helpers import record_provider_failure
+
+                    record_provider_failure(agent, FailoverReason.unknown)
                     
                     # Eager fallback: empty/malformed responses are a common
                     # rate-limit symptom.  Switch to fallback immediately
@@ -3326,7 +3329,7 @@ def run_conversation(
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if agent._try_activate_fallback(reason=classified.reason):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -3475,7 +3478,7 @@ def run_conversation(
                     # Try fallback before giving up entirely
                     if agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if agent._try_activate_fallback(reason=classified.reason):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -4134,6 +4137,13 @@ def run_conversation(
                 # Reset retry counter on successful JSON validation
                 agent._invalid_json_retries = 0
 
+                # A structurally valid response is not necessarily usable.
+                # Close transient circuit state only after tool names and
+                # arguments have passed semantic validation.
+                from agent.chat_completion_helpers import record_provider_success
+
+                record_provider_success(agent)
+
                 # ── Post-call guardrails ──────────────────────────
                 assistant_message.tool_calls = agent._cap_delegate_task_calls(
                     assistant_message.tool_calls
@@ -4522,6 +4532,12 @@ def run_conversation(
                     # chain.  This covers the case where a model
                     # (e.g. GLM-4.5-Air) consistently returns empty
                     # due to context degradation or provider issues.
+                    if _truly_empty:
+                        from agent.chat_completion_helpers import (
+                            record_provider_failure,
+                        )
+
+                        record_provider_failure(agent, FailoverReason.unknown)
                     if _truly_empty and agent._fallback_chain:
                         logger.warning(
                             "Empty response after %d retries — "
@@ -4595,7 +4611,10 @@ def run_conversation(
                     final_response = "(empty)"
                     break
                 
-                # Reset retry counter/signature on successful content
+                # Reset circuit and retry state only after visible content.
+                from agent.chat_completion_helpers import record_provider_success
+
+                record_provider_success(agent)
                 agent._empty_content_retries = 0
                 agent._thinking_prefill_retries = 0
                 # Successful content reached — drop any buffered retry

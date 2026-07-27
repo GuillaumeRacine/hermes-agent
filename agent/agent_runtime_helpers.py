@@ -984,6 +984,104 @@ def restore_primary_runtime(agent) -> bool:
     The gateway caches agents across messages (``_agent_cache`` in
     ``gateway/run.py``), so this restoration IS needed there too.
     """
+    rt = agent._primary_runtime
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.provider_circuits import (
+            circuit_status,
+            claim_probe,
+            state_path,
+        )
+
+        _circuit_config = load_config()
+        if (_circuit_config.get("provider_circuits") or {}).get("enabled", True):
+            _status = circuit_status(
+                rt.get("circuit_provider") or rt["provider"],
+                rt["model"],
+                path=state_path(_circuit_config),
+            )
+            if _status["status"] == "probe_eligible" and not claim_probe(
+                rt.get("circuit_provider") or rt["provider"],
+                rt["model"],
+                path=state_path(_circuit_config),
+                config=_circuit_config,
+            ):
+                _status = {"status": "open", "open_until": "probe lease"}
+            if _status["status"] == "open":
+                # Keep an already-active fallback pinned for this turn. For a
+                # fresh agent, start at the first healthy fallback before any
+                # request reaches the known-unavailable primary.
+                if agent._fallback_activated:
+                    _fallback_status = circuit_status(
+                        getattr(agent, "_circuit_provider", None)
+                        or getattr(agent, "provider", ""),
+                        getattr(agent, "model", ""),
+                        path=state_path(_circuit_config),
+                    )
+                    if (
+                        _fallback_status["status"] == "probe_eligible"
+                        and not claim_probe(
+                            getattr(agent, "_circuit_provider", None)
+                            or getattr(agent, "provider", ""),
+                            getattr(agent, "model", ""),
+                            path=state_path(_circuit_config),
+                            config=_circuit_config,
+                        )
+                    ):
+                        _fallback_status = {
+                            "status": "open",
+                            "open_until": "probe lease",
+                        }
+                    if _fallback_status["status"] == "unavailable":
+                        agent._provider_circuit_blocked_reason = (
+                            "Provider circuit state is unavailable for the "
+                            "active fallback; refusing to start a model request."
+                        )
+                        return False
+                    if _fallback_status["status"] == "open":
+                        activated = agent._try_activate_fallback()
+                        if not activated:
+                            agent._provider_circuit_blocked_reason = (
+                                "Primary and active fallback provider circuits "
+                                "are open and no healthy fallback remains."
+                            )
+                        return activated
+                    agent._provider_circuit_blocked_reason = None
+                    return False
+                agent._fallback_index = 0
+                if agent._fallback_chain:
+                    logger.info(
+                        "Primary circuit open for %s/%s until %s; "
+                        "activating a healthy fallback before the request",
+                        rt["provider"],
+                        rt["model"],
+                        _status.get("open_until") or "unknown",
+                    )
+                    activated = agent._try_activate_fallback()
+                    if not activated:
+                        agent._provider_circuit_blocked_reason = (
+                            "Primary provider circuit is open and no healthy "
+                            "fallback is available."
+                        )
+                    return activated
+                agent._provider_circuit_blocked_reason = (
+                    "Primary provider circuit is open and no fallback is configured."
+                )
+                return False
+            if _status["status"] == "unavailable":
+                agent._provider_circuit_blocked_reason = (
+                    "Provider circuit state is unavailable; refusing to start a "
+                    "model request until circuit state is repaired."
+                )
+                return False
+            agent._provider_circuit_blocked_reason = None
+    except Exception:
+        logger.warning("Primary provider circuit check failed closed", exc_info=True)
+        agent._provider_circuit_blocked_reason = (
+            "Provider circuit preflight failed; refusing to start a model request."
+        )
+        return False
+
     if not agent._fallback_activated:
         # Reset the chain index even when no fallback was activated this
         # turn.  Without this, a turn where _try_activate_fallback() was
@@ -998,11 +1096,13 @@ def restore_primary_runtime(agent) -> bool:
     if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
         return False  # primary still in rate-limit cooldown, stay on fallback
 
-    rt = agent._primary_runtime
     try:
         # ── Core runtime state ──
         agent.model = rt["model"]
         agent.provider = rt["provider"]
+        agent._circuit_provider = (
+            rt.get("circuit_provider") or rt["provider"]
+        )
         agent.base_url = rt["base_url"]           # setter updates _base_url_lower
         agent.api_mode = rt["api_mode"]
         if hasattr(agent, "_transport_cache"):
@@ -1494,6 +1594,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             "_anthropic_base_url",
             "_is_anthropic_oauth",
             "_config_context_length",
+            "_circuit_provider",
         )
     }
     # _client_kwargs is a dict — snapshot a shallow copy so mutating the
@@ -1513,6 +1614,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         # ── Swap core runtime fields ──
         agent.model = new_model
         agent.provider = new_provider
+        agent._circuit_provider = new_provider
         # Use new base_url when provided; only fall back to current when the
         # new provider genuinely has no endpoint (e.g. native SDK providers).
         # Without this guard the old provider's URL (e.g. Ollama's localhost
@@ -1674,6 +1776,11 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     agent._primary_runtime = {
         "model": agent.model,
         "provider": agent.provider,
+        "circuit_provider": getattr(
+            agent,
+            "_circuit_provider",
+            agent.provider,
+        ),
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),

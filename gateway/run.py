@@ -1837,6 +1837,12 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"),
+        "circuit_provider": runtime.get("circuit_provider")
+        or (
+            runtime.get("requested_provider")
+            if runtime.get("provider") == "custom"
+            else runtime.get("provider")
+        ),
         "api_mode": runtime.get("api_mode"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
@@ -3528,7 +3534,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
+    def _resolve_turn_agent_config(
+        self,
+        user_message: str,
+        model: str,
+        runtime_kwargs: dict,
+        *,
+        allow_guarded_activation: bool = False,
+        pin_key: str | None = None,
+        uninspected_attachments: bool = False,
+    ) -> dict:
         """Build the effective model/runtime config for a single turn.
 
         Always uses the session's primary model/provider.  If `/fast` is
@@ -3547,6 +3562,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
             "max_tokens": runtime_kwargs.get("max_tokens"),
+            "circuit_provider": runtime_kwargs.get("circuit_provider"),
         }
         route = {
             "model": model,
@@ -3561,21 +3577,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ),
         }
         try:
-            from hermes_cli.adaptive_routing import observe_shadow_route
+            from hermes_cli.adaptive_routing import (
+                apply_guarded_route,
+                get_route_pin,
+                observe_shadow_route,
+            )
             from hermes_cli.config import load_config
 
+            _routing_config = load_config()
             route["adaptive_routing"] = observe_shadow_route(
                 user_message,
                 model,
                 str(runtime["provider"] or ""),
-                load_config(),
+                _routing_config,
+                assume_private=uninspected_attachments,
             )
+            _existing_pin = (
+                get_route_pin(pin_key, _routing_config)
+                if pin_key
+                else None
+            )
+            if allow_guarded_activation or _existing_pin:
+                route = apply_guarded_route(
+                    route,
+                    route["adaptive_routing"],
+                    _routing_config,
+                    pin_key=pin_key,
+                )
         except Exception:
             logger.debug(
                 "Adaptive route observation failed",
                 exc_info=True,
             )
-            route["adaptive_routing"] = None
+            route["adaptive_routing"] = (
+                {
+                    "mode": "guarded",
+                    "active": None,
+                    "activation_blockers": [
+                        "adaptive routing preflight failed"
+                    ],
+                    "block_execution": True,
+                }
+                if allow_guarded_activation
+                else None
+            )
 
         service_tier = getattr(self, "_service_tier", None)
         if not service_tier:
@@ -11883,7 +11928,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reasoning_config = self._resolve_session_reasoning_config(source=source)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
-            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(
+                prompt,
+                model,
+                runtime_kwargs,
+                allow_guarded_activation=True,
+                pin_key=task_id,
+                uninspected_attachments=bool(media_urls),
+            )
+            _route_decision = turn_route.get("adaptive_routing") or {}
+            if _route_decision.get("block_execution"):
+                await adapter.send(
+                    source.chat_id,
+                    (
+                        f"⛔ Background task {task_id} was blocked by the "
+                        "model-routing safety gate. No model request was sent."
+                    ),
+                    metadata=_thread_metadata,
+                )
+                return
+
+            task_fallback_model = self._fallback_model
+            from hermes_cli.adaptive_routing import (
+                filter_fallbacks_for_decision,
+            )
+
+            task_fallback_model = filter_fallbacks_for_decision(
+                task_fallback_model,
+                _route_decision,
+            )
 
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).
@@ -11903,9 +11976,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.warning("Background task vision enrichment failed: %s", e)
 
             def run_sync():
+                agent_runtime = dict(turn_route["runtime"])
+                circuit_provider = str(
+                    agent_runtime.pop("circuit_provider", "")
+                    or agent_runtime.get("provider")
+                    or ""
+                )
                 agent = AIAgent(
                     model=turn_route["model"],
-                    **turn_route["runtime"],
+                    **agent_runtime,
                     max_iterations=max_iterations,
                     quiet_mode=True,
                     verbose_logging=False,
@@ -11930,8 +12009,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     session_db=self._session_db,
-                    fallback_model=self._fallback_model,
+                    fallback_model=task_fallback_model,
                 )
+                agent._circuit_provider = circuit_provider
+                if isinstance(getattr(agent, "_primary_runtime", None), dict):
+                    agent._primary_runtime["circuit_provider"] = circuit_provider
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,
@@ -16156,7 +16238,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_message="interim_assistant_callback scheduling error",
                 )
 
-            turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(
+                message,
+                model,
+                runtime_kwargs,
+            )
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -16266,9 +16352,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if agent is None:
                 # Config changed or first message — create fresh agent
+                agent_runtime = dict(turn_route["runtime"])
+                circuit_provider = str(
+                    agent_runtime.pop("circuit_provider", "")
+                    or agent_runtime.get("provider")
+                    or ""
+                )
                 agent = AIAgent(
                     model=turn_route["model"],
-                    **turn_route["runtime"],
+                    **agent_runtime,
                     max_iterations=max_iterations,
                     quiet_mode=True,
                     verbose_logging=False,
@@ -16298,6 +16390,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
+                agent._circuit_provider = circuit_provider
+                if isinstance(getattr(agent, "_primary_runtime", None), dict):
+                    agent._primary_runtime["circuit_provider"] = circuit_provider
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
                         _cache[session_key] = (agent, _sig, _current_msg_count)

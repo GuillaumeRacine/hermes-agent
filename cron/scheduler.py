@@ -1827,6 +1827,9 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     """
     user_prompt = str(job.get("prompt") or "")
     prompt = user_prompt
+    prompt_addendum = str(job.get("prompt_addendum") or "").strip()
+    if prompt_addendum:
+        prompt = f"{prompt}\n\n{prompt_addendum}" if prompt else prompt_addendum
     skills = job.get("skills")
     # True when runtime-collected DATA (script stdout, upstream-job output)
     # has been injected into the prompt. Data content legitimately quotes

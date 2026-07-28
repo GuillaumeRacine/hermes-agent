@@ -2567,6 +2567,16 @@ class TestBuildJobPromptSilentHint:
         prompt_pos = result.index("My custom prompt")
         assert system_pos < prompt_pos
 
+    def test_prompt_addendum_follows_primary_prompt(self):
+        job = {
+            "prompt": "Do the work",
+            "prompt_addendum": "Deliver each item as a thread reply.",
+        }
+
+        result = _build_job_prompt(job)
+
+        assert result.index("Do the work") < result.index("Deliver each item as a thread reply.")
+
 
 class TestParseWakeGate:
     """Unit tests for _parse_wake_gate — pure function, no side effects."""

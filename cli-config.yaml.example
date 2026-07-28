@@ -768,6 +768,10 @@ platform_toolsets:
 #   require_mention: true            # Require @mention in server channels (default: true)
 #   auto_thread: true                # Auto-create thread on @mention (default: true)
 #   free_response_channels: ""       # Channel IDs where no mention is needed
+#   reaction_feedback_channels: []   # Channels where marked bot messages accept 👍/👎 feedback
+#   reaction_feedback_users: []      # Member IDs allowed to steer the feedback profile
+#   reaction_feedback_state: ""      # Optional JSON path (defaults under HERMES_HOME/state)
+#   reaction_feedback_marker: "React 👍/👎 to tune future briefs."
 #   reactions: true                  # Show processing reactions (default: true)
 #   history_backfill: true           # Recover missed channel messages on mention (default: true)
 #   history_backfill_limit: 50       # Max messages to scan backwards (default: 50)

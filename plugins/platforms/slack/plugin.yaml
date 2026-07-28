@@ -37,3 +37,19 @@ optional_env:
     description: "Display name for the Slack home channel"
     prompt: "Home channel display name"
     password: false
+  - name: SLACK_REACTION_FEEDBACK_CHANNELS
+    description: "Comma-separated channel IDs where configured bot-message reactions become durable feedback"
+    prompt: "Reaction feedback channels"
+    password: false
+  - name: SLACK_REACTION_FEEDBACK_USERS
+    description: "Comma-separated member IDs whose thumbs-up/down reactions are accepted as feedback"
+    prompt: "Reaction feedback users"
+    password: false
+  - name: SLACK_REACTION_FEEDBACK_STATE
+    description: "Optional JSON state path for durable reaction feedback"
+    prompt: "Reaction feedback state path"
+    password: false
+  - name: SLACK_REACTION_FEEDBACK_MARKER
+    description: "Marker text required on a bot message before its reactions are recorded"
+    prompt: "Reaction feedback marker"
+    password: false

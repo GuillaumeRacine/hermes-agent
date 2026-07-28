@@ -45,6 +45,15 @@ class TestSlackFullManifest:
         bot_scopes = manifest["oauth_config"]["scopes"]["bot"]
         assert "groups:read" in bot_scopes
 
+    def test_reaction_feedback_scope_and_events_are_included(self):
+        manifest = _build_full_manifest("Hermes", "Your Hermes agent on Slack")
+
+        bot_scopes = manifest["oauth_config"]["scopes"]["bot"]
+        bot_events = manifest["settings"]["event_subscriptions"]["bot_events"]
+        assert "reactions:read" in bot_scopes
+        assert "reaction_added" in bot_events
+        assert "reaction_removed" in bot_events
+
     def test_assistant_features_remain_enabled(self):
         manifest = _build_full_manifest("Hermes", "Your Hermes agent on Slack")
 

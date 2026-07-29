@@ -786,3 +786,176 @@ def test_private_pin_escalation_blocks_primary_and_filters_fallbacks(tmp_path):
         [{"provider": "zai", "model": "cloud"}],
         decision,
     ) == []
+
+
+def test_classify_phase_precedence():
+    from hermes_cli.adaptive_routing import classify_phase
+
+    assert classify_phase("anything", explicit="review") == {
+        "phase": "review",
+        "source": "explicit",
+    }
+    assert classify_phase("phase:build then summarize") == {
+        "phase": "build",
+        "source": "tag",
+    }
+    assert classify_phase("run an adversarial bar-raiser review of the diff")[
+        "phase"
+    ] == "review"
+    assert classify_phase("draft the architecture plan for the feature")[
+        "phase"
+    ] == "plan"
+    assert classify_phase("implement the parser and fix the failing test")[
+        "phase"
+    ] == "build"
+    assert classify_phase("hello there", default="build") == {
+        "phase": "build",
+        "source": "config_default",
+    }
+    assert classify_phase("hello there") == {"phase": None, "source": "none"}
+
+
+def _phase_policy(path):
+    path.write_text(
+        json.dumps(
+            {
+                "mode": "shadow",
+                "classes": {
+                    "C1": {
+                        "status": "hold",
+                        "shadow_recommendation": {
+                            "provider": "cheap-local",
+                            "runtime": {
+                                "mode": "hermes",
+                                "provider": "local-ollama",
+                                "model": "llama3.2:3b",
+                            },
+                        },
+                        "phases": {
+                            "review": {
+                                "status": "hold",
+                                "shadow_recommendation": {
+                                    "provider": "frontier-review",
+                                    "runtime": {
+                                        "mode": "hermes",
+                                        "provider": "claude-code",
+                                        "model": "sonnet",
+                                    },
+                                },
+                            }
+                        },
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_phase_entry_overrides_class_recommendation(tmp_path):
+    from hermes_cli.adaptive_routing import decide_route
+
+    policy = tmp_path / "policy.json"
+    _phase_policy(policy)
+    config = {
+        "adaptive_routing": {
+            "enabled": True,
+            "mode": "shadow",
+            "policy_path": str(policy),
+        }
+    }
+    decision = decide_route(
+        "summarize this",
+        "gpt",
+        "openai-codex",
+        config,
+        phase="review",
+    )
+    assert decision["class"] == "C1"
+    assert decision["phase"] == "review"
+    assert decision["phase_source"] == "explicit"
+    assert decision["phase_policy_applied"] is True
+    assert decision["recommended"]["provider"] == "claude-code"
+    assert decision["recommended"]["model"] == "sonnet"
+
+
+def test_phase_without_policy_entry_falls_back_to_class(tmp_path):
+    from hermes_cli.adaptive_routing import decide_route
+
+    policy = tmp_path / "policy.json"
+    _phase_policy(policy)
+    config = {
+        "adaptive_routing": {
+            "enabled": True,
+            "mode": "shadow",
+            "policy_path": str(policy),
+        }
+    }
+    decision = decide_route(
+        "summarize this",
+        "gpt",
+        "openai-codex",
+        config,
+        phase="build",
+    )
+    assert decision["phase"] == "build"
+    assert decision["phase_policy_applied"] is False
+    assert decision["recommended"]["provider"] == "local-ollama"
+
+
+def test_route_outcome_event_includes_phase(tmp_path):
+    from hermes_cli.adaptive_routing import observe_shadow_route
+
+    policy = tmp_path / "policy.json"
+    telemetry = tmp_path / "events.jsonl"
+    _phase_policy(policy)
+    config = {
+        "adaptive_routing": {
+            "enabled": True,
+            "mode": "shadow",
+            "policy_path": str(policy),
+            "telemetry_path": str(telemetry),
+        }
+    }
+    decision = observe_shadow_route(
+        "run the adversarial review of the module",
+        "gpt",
+        "openai-codex",
+        config,
+    )
+    assert decision["phase"] == "review"
+    assert decision["phase_source"] == "keyword"
+    agent = SimpleNamespace(
+        provider="openai-codex",
+        model="gpt",
+        session_input_tokens=10,
+        session_output_tokens=5,
+        session_cache_read_tokens=0,
+        session_cache_write_tokens=0,
+        session_reasoning_tokens=0,
+        session_total_tokens=15,
+        session_api_calls=1,
+        session_estimated_cost_usd=0.0,
+        session_cost_status="unknown",
+        _fallback_index=0,
+    )
+    usage_before = capture_route_usage(agent)
+    record_route_outcome(
+        decision,
+        {"completed": True, "api_calls": 1, "last_prompt_tokens": 5},
+        agent,
+        config,
+        usage_before=usage_before,
+        started_monotonic=time.monotonic(),
+        surface="cli",
+    )
+    events = [
+        json.loads(line)
+        for line in telemetry.read_text().splitlines()
+        if line.strip()
+    ]
+    outcome_events = [
+        event for event in events if event["event"] == "route_outcome"
+    ]
+    assert outcome_events
+    assert outcome_events[-1]["phase"] == "review"

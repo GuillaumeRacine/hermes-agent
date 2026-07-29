@@ -195,6 +195,70 @@ def _policy_attestation_valid(payload: dict[str, Any]) -> bool:
     return hmac.compare_digest(attestation["signature"], expected)
 
 
+_PHASES = ("plan", "build", "review")
+_PHASE_TAG_PATTERN = re.compile(r"\bphase\s*[:=]\s*(plan|build|review)\b")
+_REVIEW_PHASE_PATTERNS = (
+    r"\breview\b",
+    r"\baudit\b",
+    r"\bbar[- ]?rais",
+    r"\badversarial\b",
+    r"\bcritique\b",
+    r"\bpost[- ]?mortem\b",
+    r"\bverification pass\b",
+    r"\bship[- ]?readiness\b",
+)
+_PLAN_PHASE_PATTERNS = (
+    r"\bplan\b",
+    r"\bplanning\b",
+    r"\bdesign doc\b",
+    r"\barchitect",
+    r"\bspec\b",
+    r"\bspecification\b",
+    r"\bbrainstorm",
+    r"\broadmap\b",
+    r"\bbreak (?:this |it )?down\b",
+)
+_BUILD_PHASE_PATTERNS = (
+    r"\bimplement",
+    r"\bbuild\b",
+    r"\brefactor",
+    r"\bfix (?:the |this |a )?\w*(?:bug|test|error|issue)\b",
+    r"\bwrite (?:the )?code\b",
+    r"\bcode (?:this |it )?up\b",
+    r"\bwire (?:up|in)\b",
+    r"\bdebug\b",
+    r"\badd (?:a |the )?(?:feature|endpoint|test|handler|flag)\b",
+)
+
+
+def classify_phase(
+    message: str,
+    *,
+    explicit: str | None = None,
+    default: str | None = None,
+) -> dict[str, str | None]:
+    """Resolve the workflow phase for a turn without retaining content.
+
+    Precedence: explicit caller hint > inline "phase:<name>" tag > keyword
+    inference (review > plan > build) > configured default > none.
+    """
+    if explicit in _PHASES:
+        return {"phase": explicit, "source": "explicit"}
+    normalized = " ".join(str(message or "").lower().split())
+    tag = _PHASE_TAG_PATTERN.search(normalized)
+    if tag:
+        return {"phase": tag.group(1), "source": "tag"}
+    if _matches(normalized, _REVIEW_PHASE_PATTERNS):
+        return {"phase": "review", "source": "keyword"}
+    if _matches(normalized, _PLAN_PHASE_PATTERNS):
+        return {"phase": "plan", "source": "keyword"}
+    if _matches(normalized, _BUILD_PHASE_PATTERNS):
+        return {"phase": "build", "source": "keyword"}
+    if default in _PHASES:
+        return {"phase": default, "source": "config_default"}
+    return {"phase": None, "source": "none"}
+
+
 def classify_task(
     message: str,
     *,
@@ -436,6 +500,7 @@ def decide_route(
     config: dict[str, Any],
     *,
     assume_private: bool = False,
+    phase: str | None = None,
 ) -> dict[str, Any] | None:
     routing = config.get("adaptive_routing") or {}
     mode = str(routing.get("mode") or "shadow").strip().lower()
@@ -453,6 +518,18 @@ def decide_route(
     class_policy = (
         (policy.get("classes") or {}).get(classification["class"]) if policy else {}
     ) or {}
+    phase_info = classify_phase(
+        message,
+        explicit=phase,
+        default=str(routing.get("default_phase") or "") or None,
+    )
+    phase_name = phase_info["phase"]
+    phase_policy_applied = False
+    if phase_name:
+        phase_entry = (class_policy.get("phases") or {}).get(phase_name)
+        if isinstance(phase_entry, dict) and phase_entry:
+            class_policy = phase_entry
+            phase_policy_applied = True
     recommendation = class_policy.get("shadow_recommendation")
     recommended_provider = _runtime_provider(recommendation)
     blocked_for_privacy = False
@@ -552,6 +629,9 @@ def decide_route(
         "schema_version": 1,
         "mode": mode,
         "class": classification["class"],
+        "phase": phase_name,
+        "phase_source": phase_info["source"],
+        "phase_policy_applied": phase_policy_applied,
         "reason": classification["reason"],
         "private": classification["private"],
         "allowed_fallback_providers": (
@@ -1028,6 +1108,11 @@ def record_route_outcome(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "decision_id": decision_id,
         "class": (decision or {}).get("class"),
+        "phase": (
+            _safe_telemetry_identifier((decision or {}).get("phase"))
+            if (decision or {}).get("phase")
+            else None
+        ),
         "surface": _safe_telemetry_identifier(surface),
         "actual": {
             "provider": _safe_telemetry_identifier(

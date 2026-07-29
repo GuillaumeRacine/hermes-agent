@@ -959,3 +959,62 @@ def test_route_outcome_event_includes_phase(tmp_path):
     ]
     assert outcome_events
     assert outcome_events[-1]["phase"] == "review"
+
+
+def test_malformed_phases_value_never_crashes_decide(tmp_path):
+    from hermes_cli.adaptive_routing import decide_route
+
+    for phases_value in ("review", ["review"], 7, None):
+        policy = tmp_path / "policy.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "mode": "shadow",
+                    "classes": {"C1": {"status": "hold", "phases": phases_value}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        config = {
+            "adaptive_routing": {
+                "enabled": True,
+                "mode": "shadow",
+                "policy_path": str(policy),
+            }
+        }
+        decision = decide_route(
+            "summarize this",
+            "gpt",
+            "openai-codex",
+            config,
+            phase="review",
+        )
+        assert decision["phase"] == "review"
+        assert decision["phase_policy_applied"] is False
+
+
+def test_metadata_only_phase_entry_keeps_class_recommendation(tmp_path):
+    from hermes_cli.adaptive_routing import decide_route
+
+    policy = tmp_path / "policy.json"
+    _phase_policy(policy)
+    payload = json.loads(policy.read_text())
+    payload["classes"]["C1"]["phases"]["review"] = {"note": "metadata only"}
+    policy.write_text(json.dumps(payload), encoding="utf-8")
+    config = {
+        "adaptive_routing": {
+            "enabled": True,
+            "mode": "shadow",
+            "policy_path": str(policy),
+        }
+    }
+    decision = decide_route(
+        "summarize this",
+        "gpt",
+        "openai-codex",
+        config,
+        phase="review",
+    )
+    assert decision["phase_policy_applied"] is False
+    assert decision["recommended"]["provider"] == "local-ollama"
+    assert decision["promotion_status"] == "hold"

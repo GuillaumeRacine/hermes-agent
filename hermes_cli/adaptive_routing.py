@@ -526,8 +526,19 @@ def decide_route(
     phase_name = phase_info["phase"]
     phase_policy_applied = False
     if phase_name:
-        phase_entry = (class_policy.get("phases") or {}).get(phase_name)
-        if isinstance(phase_entry, dict) and phase_entry:
+        phase_entries = class_policy.get("phases")
+        phase_entry = (
+            phase_entries.get(phase_name)
+            if isinstance(phase_entries, dict)
+            else None
+        )
+        # Swap only when the entry is a substantive route decision; a
+        # metadata-only entry must not wipe the class-level recommendation
+        # or report a contradictory promotion status.
+        if isinstance(phase_entry, dict) and any(
+            key in phase_entry
+            for key in ("status", "shadow_recommendation", "selected")
+        ):
             class_policy = phase_entry
             phase_policy_applied = True
     recommendation = class_policy.get("shadow_recommendation")

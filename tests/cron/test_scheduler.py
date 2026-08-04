@@ -682,6 +682,39 @@ class TestDeliverResultWrapping:
         assert send_mock.await_args_list[2].args[3] == "Trend item two"
         assert send_mock.await_args_list[2].kwargs["thread_id"] == "111.222"
 
+    def test_slack_threaded_delivery_does_not_require_job_feature_flag(self):
+        """Every Slack cron can use the canonical parent/reply marker."""
+        from gateway.config import Platform
+        from cron.scheduler import SLACK_THREAD_REPLY_MARKER
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.SLACK: pconfig}
+        send_mock = AsyncMock(
+            side_effect=[
+                {"success": True, "message_id": "222.100"},
+                {"success": True, "message_id": "222.101"},
+            ]
+        )
+        content = f"One useful sentence.\n{SLACK_THREAD_REPLY_MARKER}\nEvidence and next action."
+        job = {
+            "id": "ordinary-slack-report",
+            "deliver": "slack:C_REPORTS",
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=send_mock), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}):
+            result = _deliver_result(job, content)
+
+        assert result is None
+        assert send_mock.await_count == 2
+        assert send_mock.await_args_list[0].args[3] == "One useful sentence."
+        assert send_mock.await_args_list[0].kwargs.get("thread_id") is None
+        assert send_mock.await_args_list[1].args[3] == "Evidence and next action."
+        assert send_mock.await_args_list[1].kwargs["thread_id"] == "222.100"
+
     def test_slack_threaded_delivery_without_markers_uses_normal_send(self):
         """Zero-item briefs remain a single ordinary Slack message."""
         from gateway.config import Platform
@@ -705,6 +738,33 @@ class TestDeliverResultWrapping:
         assert result is None
         send_mock.assert_awaited_once()
         assert send_mock.await_args.args[3] == "No qualifying signals today."
+
+    def test_legacy_multiline_slack_report_moves_detail_to_thread(self):
+        """Legacy scripts get a safe headline/thread split while they migrate."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.SLACK: pconfig}
+        send_mock = AsyncMock(
+            side_effect=[
+                {"success": True, "message_id": "333.100"},
+                {"success": True, "message_id": "333.101"},
+            ]
+        )
+        job = {"id": "legacy-report", "deliver": "slack:C_REPORTS"}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=send_mock), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}):
+            result = _deliver_result(job, "One useful headline.\nFact one.\nNext action.")
+
+        assert result is None
+        assert send_mock.await_count == 2
+        assert send_mock.await_args_list[0].args[3] == "One useful headline."
+        assert send_mock.await_args_list[1].args[3] == "Fact one.\nNext action."
+        assert send_mock.await_args_list[1].kwargs["thread_id"] == "333.100"
 
     def test_delivery_extracts_media_tags_before_send(self, tmp_path, monkeypatch):
         """Cron delivery should pass MEDIA attachments separately to the send helper."""

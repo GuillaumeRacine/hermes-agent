@@ -1084,6 +1084,22 @@ def _split_slack_threaded_delivery(content: str) -> Optional[List[str]]:
     return parts
 
 
+def _split_slack_headline_and_detail(content: str) -> Optional[List[str]]:
+    """Use the first non-empty line as parent for legacy multi-line reports.
+
+    Canonical producers should emit ``SLACK_THREAD_REPLY_MARKER``. This narrow
+    fallback keeps older deterministic scripts from dumping their full report
+    into a channel while they migrate. It never invents or truncates text.
+    """
+    if not isinstance(content, str) or SLACK_THREAD_REPLY_MARKER in content:
+        return None
+    lines = [line.strip() for line in content.strip().splitlines()]
+    lines = [line for line in lines if line]
+    if len(lines) < 2 or len(lines[0]) > 240:
+        return None
+    return [lines[0], "\n".join(lines[1:])]
+
+
 def _run_standalone_delivery(coro_factory):
     """Run a standalone platform send from sync cron delivery code."""
     coro = coro_factory()
@@ -1287,15 +1303,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             delivery_errors.append(msg)
             continue
 
-        # Item-level Slack feedback needs one reactable message per item. The
-        # agent emits a compact parent followed by structured reply markers;
-        # cron consumes those markers and sends the remaining parts into the
-        # new parent's thread. Zero-item briefs contain no marker and continue
-        # through the ordinary one-message delivery path.
+        # Structured Slack output uses one compact parent plus thread replies.
+        # Any Slack cron may emit the marker; requiring a per-job feature flag
+        # caused correctly formatted reports to arrive as one channel wall
+        # when prompts evolved without the matching job metadata. Existing
+        # thread-targeted jobs and media delivery keep their normal path.
         threaded_parts = (
-            _split_slack_threaded_delivery(cleaned_delivery_content)
-            if job.get("slack_threaded_delivery")
-            and platform_name.lower() == "slack"
+            (
+                _split_slack_threaded_delivery(cleaned_delivery_content)
+                or _split_slack_headline_and_detail(cleaned_delivery_content)
+            )
+            if platform_name.lower() == "slack"
             and not thread_id
             and not media_files
             else None

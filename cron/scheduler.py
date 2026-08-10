@@ -2937,7 +2937,15 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         delivery_error = None
         if should_deliver:
             try:
-                delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                delivery_job = job
+                failure_target = os.environ.get("HERMES_CRON_FAILURE_DELIVER", "").strip()
+                if not success and failure_target:
+                    delivery_job = dict(job)
+                    delivery_job["deliver"] = failure_target
+                    delivery_job["origin"] = None
+                delivery_error = _deliver_result(
+                    delivery_job, deliver_content, adapters=adapters, loop=loop
+                )
             except Exception as de:
                 delivery_error = str(de)
                 logger.error("Delivery failed for job %s: %s", job["id"], de)

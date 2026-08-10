@@ -2562,6 +2562,23 @@ class TestSilentDelivery:
             tick(verbose=False)
         deliver_mock.assert_called_once()
 
+    def test_failed_job_uses_configured_failure_target(self):
+        """Cron failures route to the ops channel without changing success delivery."""
+        job = self._make_job()
+        job["deliver"] = "slack:content-channel"
+        with patch("cron.scheduler.run_job", return_value=(False, "# output", "", "some error")), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run"), \
+             patch.dict(os.environ, {"HERMES_CRON_FAILURE_DELIVER": "slack:systems-channel"}):
+            from cron.scheduler import run_one_job
+            run_one_job(job)
+
+        delivered_job = deliver_mock.call_args.args[0]
+        assert delivered_job["deliver"] == "slack:systems-channel"
+        assert delivered_job["origin"] is None
+        assert job["deliver"] == "slack:content-channel"
+
     def test_output_saved_even_when_delivery_suppressed(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# full output", "[SILENT]", None)), \

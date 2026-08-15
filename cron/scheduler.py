@@ -99,6 +99,55 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     return f"⚠️ Cron '{job_name}' failed: {cleaned}"
 
 
+# --- Repeat-failure alert suppression (#32) ------------------------------
+#
+# Every helper below fails open: if streak bookkeeping breaks for any reason we
+# deliver the alert as before. Losing suppression is noisy; losing the alert
+# entirely is how an outage goes unnoticed.
+
+def _record_cron_failure(job: dict, error: str | None):
+    """Record a failed run and decide whether to alert. None => always alert."""
+    try:
+        from cron.failure_alerts import record_failure
+        return record_failure(job, error)
+    except Exception as exc:
+        logger.debug("Job '%s': failure-streak bookkeeping failed: %s", job.get("id"), exc)
+        return None
+
+
+def _clear_cron_failure_streak(job: dict) -> None:
+    """Forget a job's failure streak after it succeeds."""
+    try:
+        from cron.failure_alerts import clear_failure
+        cleared = clear_failure(job)
+        if cleared:
+            logger.info(
+                "Job '%s': recovered after %d consecutive failures", job.get("id"), cleared
+            )
+    except Exception as exc:
+        logger.debug("Job '%s': failed to clear failure streak: %s", job.get("id"), exc)
+
+
+def _pause_repeatedly_failing_job(job: dict, decision) -> str:
+    """Pause a job stuck in an identical failure loop; return a message tail."""
+    reason = (
+        f"Auto-paused after {decision.streak} consecutive identical failures "
+        f"since {decision.first_seen} (#32)."
+    )
+    try:
+        from cron.jobs import pause_job
+        if pause_job(job["id"], reason):
+            logger.warning("Job '%s': %s", job.get("id"), reason)
+            return (
+                f"\n\nAuto-paused after {decision.streak} identical failures. "
+                f"Fix the cause, then `hermes cron resume {job['id']}`."
+            )
+        return "\n\nAuto-pause failed: job could not be resolved. It will keep failing."
+    except Exception as exc:
+        logger.error("Job '%s': auto-pause failed: %s", job.get("id"), exc)
+        return f"\n\nAuto-pause failed ({exc}). This job will keep alerting until fixed."
+
+
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the fully-assembled prompt trips the
     injection scanner. Caught in run_job so the operator sees a clean
@@ -2918,8 +2967,21 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
         # Deliver the final response to the origin/target chat.
         # If the agent responded with [SILENT], skip delivery (but
-        # output is already saved above).  Failed jobs always deliver.
-        deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
+        # output is already saved above).
+        #
+        # Failed jobs used to deliver unconditionally, so a job broken the same
+        # way every run alerted every run — 52 identical messages in 13h (#32).
+        # Repeated *identical* failures now back off exponentially and pause the
+        # job outright once it is clearly not going to fix itself.
+        failure_decision = None
+        if success:
+            deliver_content = final_response
+            _clear_cron_failure_streak(job)
+        else:
+            failure_decision = _record_cron_failure(job, error)
+            deliver_content = _summarize_cron_failure_for_delivery(job, error)
+            if failure_decision is not None:
+                deliver_content += failure_decision.summary_suffix()
         # Treat whitespace-only final responses the same as empty
         # responses: do not deliver a blank message, and let the
         # empty-response guard below mark the run as a soft failure.
@@ -2933,6 +2995,23 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         if should_deliver and success and _is_cron_silence_response(deliver_content):
             logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
             should_deliver = False
+
+        # Swallow repeat alerts for a failure we have already reported. The run
+        # is still recorded via mark_job_run below, so the watchdog and
+        # `hermes cron list` keep seeing the truth — only the chat goes quiet.
+        if should_deliver and failure_decision is not None and not failure_decision.deliver:
+            logger.info(
+                "Job '%s': failure #%d matches an already-reported error — suppressing alert",
+                job["id"], failure_decision.streak,
+            )
+            should_deliver = False
+
+        # A job failing the same way this many times running is not going to
+        # recover on its own. Pause it and say so once, rather than alerting
+        # forever on a schedule nobody is watching.
+        if failure_decision is not None and failure_decision.should_pause:
+            deliver_content += _pause_repeatedly_failing_job(job, failure_decision)
+            should_deliver = True
 
         delivery_error = None
         if should_deliver:

@@ -125,6 +125,25 @@ When `workdir` is set:
 Jobs with a `workdir` run sequentially on the scheduler tick, not in the parallel pool. This is deliberate: the cron worker applies the job workdir through process-global terminal state, so two workdir jobs running at the same time would corrupt each other's cwd. Workdir-less jobs still run in parallel as before.
 :::
 
+## Per-job model-iteration ceilings
+
+Long-running agent jobs can set a tighter model-call ceiling without reducing
+the budget for interactive Hermes sessions or other cron jobs:
+
+```bash
+hermes cron create "every 1h" "Inspect the queue and act on one item" \
+  --max-iterations 12
+
+hermes cron edit <job_id> --max-iterations 8
+hermes cron edit <job_id> --max-iterations 0  # clear the override
+```
+
+The equivalent `cronjob` tool field is `max_iterations`. Hermes always uses
+the lower of the job value and global `agent.max_turns`, so a job can tighten
+operator policy but can never widen it. Missing values preserve existing
+behavior; malformed hand-edited values fail before a model call. Script-only
+`no_agent` jobs ignore this setting because they do not invoke a model.
+
 ## Editing jobs
 
 You do not need to delete and recreate jobs just to change them.

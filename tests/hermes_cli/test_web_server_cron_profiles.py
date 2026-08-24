@@ -2,6 +2,7 @@
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 
 @pytest.fixture()
@@ -123,6 +124,7 @@ async def test_create_cron_job_normalizes_representative_core_fields(
             name="full-core-mapping",
             base_url="https://example.invalid/v1/",
             script=str(scripts_dir / "collect-status.py"),
+            max_iterations=12,
             no_agent=True,
         ),
         profile="worker_alpha",
@@ -132,6 +134,18 @@ async def test_create_cron_job_normalizes_representative_core_fields(
     assert job["base_url"] == "https://example.invalid/v1"
     assert job["script"] == "collect-status.py"
     assert job["no_agent"] is True
+    assert job["max_iterations"] == 12
+
+
+def test_cron_create_model_rejects_boolean_iteration_limit():
+    from hermes_cli import web_server
+
+    with pytest.raises(ValidationError):
+        web_server.CronJobCreate(
+            prompt="bounded",
+            schedule="every 1h",
+            max_iterations=True,
+        )
 
 
 @pytest.mark.asyncio
@@ -181,6 +195,7 @@ async def test_update_cron_job_normalizes_dashboard_core_fields(isolated_profile
                 "base_url": "https://example.invalid/v1/",
                 "script": str(scripts_dir / "collect.py"),
                 "context_from": "",
+                "max_iterations": 8,
                 "no_agent": True,
             }
         ),
@@ -191,6 +206,7 @@ async def test_update_cron_job_normalizes_dashboard_core_fields(isolated_profile
     assert updated["script"] == "collect.py"
     assert updated["context_from"] is None
     assert updated["no_agent"] is True
+    assert updated["max_iterations"] == 8
 
 
 @pytest.mark.asyncio

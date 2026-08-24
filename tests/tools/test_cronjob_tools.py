@@ -309,6 +309,36 @@ class TestUnifiedCronjobTool:
         assert updated["job"]["name"] == "New Name"
         assert updated["job"]["schedule"] == "every 120m"
 
+    def test_create_update_and_clear_max_iterations(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check",
+                schedule="every 1h",
+                max_iterations=12,
+            )
+        )
+        assert created["success"] is True
+        assert created["job"]["max_iterations"] == 12
+
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                max_iterations=8,
+            )
+        )
+        assert updated["job"]["max_iterations"] == 8
+
+        cleared = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                max_iterations=0,
+            )
+        )
+        assert "max_iterations" not in cleared["job"]
+
     def test_update_runtime_overrides_can_set_and_clear(self):
         created = json.loads(
             cronjob(

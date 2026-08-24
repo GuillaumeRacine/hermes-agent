@@ -51,6 +51,7 @@ def test_cron_create_options():
         "--name", "daily", "--deliver", "origin", "--repeat", "3",
         "--skill", "a", "--skill", "b", "--no-agent",
         "--workdir", "/tmp/x",
+        "--max-iterations", "12",
     ])
     assert ns.schedule == "0 9 * * *"
     assert ns.prompt == "daily task prompt"
@@ -60,6 +61,7 @@ def test_cron_create_options():
     assert ns.skills == ["a", "b"]
     assert ns.no_agent is True
     assert ns.workdir == "/tmp/x"
+    assert ns.max_iterations == 12
 
 
 def test_cron_edit_no_agent_tristate():
@@ -68,6 +70,12 @@ def test_cron_edit_no_agent_tristate():
     assert parser.parse_args(["cron", "edit", "j", "--no-agent"]).no_agent is True
     assert parser.parse_args(["cron", "edit", "j", "--agent"]).no_agent is False
     assert parser.parse_args(["cron", "edit", "j"]).no_agent is None
+
+
+def test_cron_edit_accepts_max_iterations_clear_sentinel():
+    parser = _build()
+    ns = parser.parse_args(["cron", "edit", "j", "--max-iterations", "0"])
+    assert ns.max_iterations == 0
 
 
 def test_cron_dispatch_func_is_injected_handler():

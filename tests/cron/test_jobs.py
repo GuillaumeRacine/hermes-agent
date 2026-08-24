@@ -1129,6 +1129,32 @@ class TestEnabledToolsets:
         assert fetched["enabled_toolsets"] == ["web", "delegation"]
 
 
+class TestMaxIterations:
+    def test_optional_limit_persists_and_can_be_cleared(self, tmp_cron_dir):
+        job = create_job(
+            prompt="bounded monitor",
+            schedule="every 1h",
+            max_iterations=12,
+        )
+        assert get_job(job["id"])["max_iterations"] == 12
+
+        update_job(job["id"], {"max_iterations": None})
+        assert get_job(job["id"])["max_iterations"] is None
+
+    def test_omitted_limit_preserves_legacy_behavior(self, tmp_cron_dir):
+        job = create_job(prompt="unbounded monitor", schedule="every 1h")
+        assert job["max_iterations"] is None
+
+    @pytest.mark.parametrize("invalid", [0, -1, False, 1.5, "not-an-int"])
+    def test_invalid_limits_are_rejected(self, tmp_cron_dir, invalid):
+        with pytest.raises(ValueError, match="positive integer"):
+            create_job(
+                prompt="invalid monitor",
+                schedule="every 1h",
+                max_iterations=invalid,
+            )
+
+
 class TestMarkJobRunConcurrency:
     """Regression tests for concurrent parallel job state writes.
 

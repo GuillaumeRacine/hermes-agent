@@ -1034,6 +1034,14 @@ class SlackAdapter(BasePlatformAdapter):
 
             @self._app.command(_slash_pattern)
             async def handle_hermes_command(ack, command):
+                channel_id = str(command.get("channel_id") or "")
+                if not self._slack_scope_allows_channel(channel_id):
+                    logger.debug(
+                        "[Slack] Silently acknowledging slash command outside configured scope: %s",
+                        channel_id,
+                    )
+                    await ack()
+                    return
                 slash = (command.get("command") or "").lstrip("/")
                 await ack(
                     response_type="ephemeral",
@@ -2524,6 +2532,12 @@ class SlackAdapter(BasePlatformAdapter):
         if not channel_type and channel_id.startswith("D"):
             channel_type = "im"
         is_dm = channel_type in {"im", "mpim"}  # Both 1:1 and group DMs
+        if not self._slack_scope_allows_channel(channel_id, is_dm=is_dm):
+            logger.debug(
+                "[Slack] Ignoring message outside configured channel/DM scope: %s",
+                channel_id,
+            )
+            return
 
         # Build thread_ts for session keying.
         # In channels: fall back to ts so each top-level @mention starts a
@@ -2587,14 +2601,6 @@ class SlackAdapter(BasePlatformAdapter):
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
         if not is_dm and bot_uid:
-            # Check allowed channels — if set, only respond in these channels (whitelist)
-            allowed_channels = self._slack_allowed_channels()
-            if allowed_channels and channel_id not in allowed_channels:
-                logger.debug(
-                    "[Slack] Ignoring message in non-allowed channel: %s", channel_id
-                )
-                return
-
             if channel_id in self._slack_free_response_channels():
                 pass  # Free-response channel — always process
             elif not self._slack_require_mention():
@@ -3635,6 +3641,15 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id = command.get("channel_id", "")
         team_id = command.get("team_id", "")
 
+        # Defense in depth for direct callers and tests. The registered Slack
+        # command handler performs this check before its visible ephemeral ack.
+        if not self._slack_scope_allows_channel(channel_id):
+            logger.debug(
+                "[Slack] Ignoring slash command outside configured scope: %s",
+                channel_id,
+            )
+            return
+
         # Track which workspace owns this channel
         if team_id and channel_id:
             self._channel_team[channel_id] = team_id
@@ -3930,8 +3945,9 @@ class SlackAdapter(BasePlatformAdapter):
         """Return the whitelist of channel IDs the bot will respond in.
 
         When non-empty, messages from channels NOT in this set are silently
-        ignored — even if the bot is @mentioned.  DMs are never filtered.
-        Empty set means no restriction (fully backward compatible).
+        ignored — even if the bot is @mentioned. DMs are governed separately
+        by ``dm_policy``. Empty set means no channel restriction (fully
+        backward compatible).
         """
         raw = self.config.extra.get("allowed_channels")
         if raw is None:
@@ -3941,6 +3957,31 @@ class SlackAdapter(BasePlatformAdapter):
         if isinstance(raw, str) and raw.strip():
             return {part.strip() for part in raw.split(",") if part.strip()}
         return set()
+
+    def _slack_dm_policy(self) -> str:
+        """Return Slack direct-message intake policy.
+
+        ``disabled`` drops both 1:1 and multi-person DMs inside the adapter,
+        before session creation or gateway dispatch. The default remains
+        ``open`` for backward compatibility; sender authorization still runs
+        through the gateway's existing Slack allowlist in that mode.
+        """
+        raw = self.config.extra.get("dm_policy")
+        if raw is None:
+            raw = os.getenv("SLACK_DM_POLICY", "open")
+        return str(raw or "open").strip().lower()
+
+    def _slack_scope_allows_channel(
+        self, channel_id: str, *, is_dm: Optional[bool] = None
+    ) -> bool:
+        """Return whether messages and slash commands may enter from a channel."""
+        channel_id = str(channel_id or "")
+        if is_dm is None:
+            is_dm = channel_id.startswith("D")
+        if is_dm:
+            return self._slack_dm_policy() != "disabled"
+        allowed_channels = self._slack_allowed_channels()
+        return not allowed_channels or channel_id in allowed_channels
 
     def _slack_mention_patterns(self) -> List["re.Pattern"]:
         """Compile optional regex wake-word patterns for channel triggers.
@@ -4223,6 +4264,8 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         os.environ["SLACK_STRICT_MENTION"] = str(slack_cfg["strict_mention"]).lower()
     if "allow_bots" in slack_cfg and not os.getenv("SLACK_ALLOW_BOTS"):
         os.environ["SLACK_ALLOW_BOTS"] = str(slack_cfg["allow_bots"]).lower()
+    if "dm_policy" in slack_cfg and not os.getenv("SLACK_DM_POLICY"):
+        os.environ["SLACK_DM_POLICY"] = str(slack_cfg["dm_policy"]).lower()
     frc = slack_cfg.get("free_response_channels")
     if frc is not None and not os.getenv("SLACK_FREE_RESPONSE_CHANNELS"):
         if isinstance(frc, list):
@@ -4270,7 +4313,7 @@ def register(ctx) -> None:
         # and the static _PLATFORMS["slack"] dict in hermes_cli/gateway.py.
         setup_fn=interactive_setup,
         # YAML→env config bridge — owns the translation of config.yaml slack:
-        # keys (require_mention, strict_mention, allow_bots,
+        # keys (require_mention, strict_mention, allow_bots, dm_policy,
         # free_response_channels, reactions, allowed_channels) into SLACK_*
         # env vars that the adapter reads via os.getenv(). Replaces the
         # hardcoded block in gateway/config.py. Hook contract: #24849.

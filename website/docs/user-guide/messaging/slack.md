@@ -398,7 +398,9 @@ Slack supports both patterns: `@mention` required to start a conversation by def
 
 Restrict the bot to a fixed set of Slack channels — useful when the bot is invited to many channels but should only respond in a few. When set, messages from channels NOT in this list are **silently ignored**, even if the bot is `@mentioned`.
 
-**DMs are exempt** from this filter, so authorized users can always reach the bot in a direct message.
+**DMs are exempt** from this channel-ID filter. To make a bot channel-only,
+set `slack.dm_policy: disabled` as shown below; Hermes then drops both 1:1 and
+multi-person DMs before creating a session or dispatching to the gateway.
 
 ```yaml
 slack:
@@ -418,6 +420,21 @@ Behavior:
 - Empty / unset → no restriction (fully backward compatible).
 - Non-empty → channel ID must be on the list, or the message is dropped before any other gating (mention requirement, `free_response_channels`, etc.) runs.
 - Slack channel IDs start with `C` (public), `G` (private), or `D` (DM). Look them up via the Slack UI's "Open channel details" → "About" panel, or via the API.
+
+Channel-only example:
+
+```yaml
+slack:
+  dm_policy: disabled
+  allowed_channels:
+    - "C0123456789"
+```
+
+The equivalent environment variable is `SLACK_DM_POLICY=disabled`. The default
+is `open` for backward compatibility, with sender authorization still enforced
+by the existing Slack user allowlist. The same channel and DM policy gates apply
+to native Slack slash commands: out-of-scope commands are silently acknowledged
+without being dispatched to Hermes.
 
 See also: [admin/user slash command split](../../reference/slash-commands.md#permissions-and-adminuser-split).
 

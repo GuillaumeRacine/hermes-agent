@@ -56,7 +56,7 @@ OTHER_CHANNEL_ID = "C9999999999"
 
 
 def _make_adapter(require_mention=None, strict_mention=None, free_response_channels=None,
-                  allowed_channels=None, mention_patterns=None):
+                  allowed_channels=None, mention_patterns=None, dm_policy=None):
     extra = {}
     if require_mention is not None:
         extra["require_mention"] = require_mention
@@ -68,6 +68,8 @@ def _make_adapter(require_mention=None, strict_mention=None, free_response_chann
         extra["allowed_channels"] = allowed_channels
     if mention_patterns is not None:
         extra["mention_patterns"] = mention_patterns
+    if dm_policy is not None:
+        extra["dm_policy"] = dm_policy
 
     adapter = object.__new__(SlackAdapter)
     adapter.platform = Platform.SLACK
@@ -100,6 +102,20 @@ def test_require_mention_true():
 def test_require_mention_string_true():
     adapter = _make_adapter(require_mention="true")
     assert adapter._slack_require_mention() is True
+
+
+def test_dm_policy_defaults_to_open(monkeypatch):
+    monkeypatch.delenv("SLACK_DM_POLICY", raising=False)
+    assert _make_adapter()._slack_dm_policy() == "open"
+
+
+def test_dm_policy_disabled_from_config():
+    assert _make_adapter(dm_policy="disabled")._slack_dm_policy() == "disabled"
+
+
+def test_dm_policy_env_fallback(monkeypatch):
+    monkeypatch.setenv("SLACK_DM_POLICY", "disabled")
+    assert _make_adapter()._slack_dm_policy() == "disabled"
 
 
 def test_require_mention_string_false():
@@ -386,6 +402,27 @@ def test_config_bridges_slack_free_response_channels(monkeypatch, tmp_path):
     assert _os.environ["SLACK_FREE_RESPONSE_CHANNELS"] == "C0AQWDLHY9M,C9999999999"
 
 
+def test_config_bridges_slack_dm_policy(monkeypatch, tmp_path):
+    from gateway.config import load_gateway_config
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "slack:\n"
+        "  dm_policy: disabled\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("SLACK_DM_POLICY", raising=False)
+
+    config = load_gateway_config()
+
+    assert config.platforms[Platform.SLACK].extra["dm_policy"] == "disabled"
+    import os as _os
+    assert _os.environ["SLACK_DM_POLICY"] == "disabled"
+
+
 def test_top_level_slack_settings_do_not_disable_env_token_setup(monkeypatch, tmp_path):
     from gateway.config import load_gateway_config
 
@@ -633,10 +670,21 @@ def test_allowed_channels_blocks_even_when_mentioned():
 
 
 def test_allowed_channels_dm_unaffected():
-    """DMs bypass the allowed_channels check entirely."""
+    """DMs bypass allowed_channels and remain governed by dm_policy."""
     adapter = _make_adapter(allowed_channels=[CHANNEL_ID])
     # DM channel IDs typically start with D; the check is guarded by `not is_dm`
     assert _would_process(adapter, is_dm=True, channel_id="DDMCHANNEL") is True
+
+
+def test_scope_allows_only_configured_channel_when_dm_policy_disabled():
+    adapter = _make_adapter(
+        allowed_channels=[CHANNEL_ID],
+        dm_policy="disabled",
+    )
+
+    assert adapter._slack_scope_allows_channel(CHANNEL_ID) is True
+    assert adapter._slack_scope_allows_channel(OTHER_CHANNEL_ID) is False
+    assert adapter._slack_scope_allows_channel("DDMCHANNEL") is False
 
 
 def test_allowed_channels_env_var_blocks_channel(monkeypatch):

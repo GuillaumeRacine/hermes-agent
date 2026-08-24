@@ -198,6 +198,29 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
         )
         return None
 
+
+def _resolve_cron_max_iterations(job: dict, cfg: dict) -> int:
+    """Return the effective model-iteration ceiling for one cron run.
+
+    The global operator setting remains authoritative. A per-job value may
+    only reduce it, never raise it. Validation is repeated at execution time
+    so a malformed hand-edited ``jobs.json`` fails before ``AIAgent`` makes a
+    model call instead of silently losing the intended safety boundary.
+    """
+    global_limit = (
+        (cfg or {}).get("agent", {}).get("max_turns")
+        or (cfg or {}).get("max_turns")
+        or 90
+    )
+    from cron.jobs import _normalize_max_iterations
+
+    normalized_global = _normalize_max_iterations(global_limit)
+    job_limit = _normalize_max_iterations(job.get("max_iterations"))
+    if job_limit is None:
+        return normalized_global
+    return min(normalized_global, job_limit)
+
+
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
@@ -2331,8 +2354,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        # Max iterations: a job may tighten, but never widen, global policy.
+        max_iterations = _resolve_cron_max_iterations(job, _cfg)
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}

@@ -744,6 +744,30 @@ def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     return str(resolved)
 
 
+def _normalize_max_iterations(value: Any) -> Optional[int]:
+    """Normalize an optional per-job model-iteration ceiling.
+
+    ``None`` and an empty string clear the override.  Boolean values are
+    rejected explicitly because ``bool`` is an ``int`` subclass in Python and
+    silently treating ``True`` as a one-turn budget is surprising.  The
+    scheduler always combines this value with the global ``agent.max_turns``
+    using ``min`` so a job can tighten, but never widen, operator policy.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool) or (
+        isinstance(value, float) and not value.is_integer()
+    ):
+        raise ValueError("Cron max_iterations must be a positive integer")
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Cron max_iterations must be a positive integer") from exc
+    if normalized < 1:
+        raise ValueError("Cron max_iterations must be a positive integer")
+    return normalized
+
+
 def _resolve_default_model_snapshot() -> Optional[str]:
     """Resolve the global default model the same way the cron ticker does.
 
@@ -865,6 +889,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    max_iterations: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -905,6 +930,9 @@ def create_job(
                 With ``no_agent=True``, ``workdir`` is still applied as the
                 script's cwd so relative paths inside the script behave
                 predictably.
+        max_iterations: Optional positive per-job model-call ceiling. The
+                        scheduler takes the lower of this value and global
+                        ``agent.max_turns``. Ignored when ``no_agent=True``.
         no_agent: When True, skip the agent entirely — run ``script`` on schedule
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
@@ -939,6 +967,7 @@ def create_job(
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
+    normalized_max_iterations = _normalize_max_iterations(max_iterations)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
 
@@ -1007,6 +1036,7 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
+        "max_iterations": normalized_max_iterations,
     }
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
@@ -1102,6 +1132,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = None
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
+
+            if "max_iterations" in updates:
+                updates["max_iterations"] = _normalize_max_iterations(
+                    updates["max_iterations"]
+                )
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})

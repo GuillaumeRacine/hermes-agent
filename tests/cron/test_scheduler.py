@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _resolve_cron_max_iterations
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -74,6 +74,19 @@ class TestPerJobToolsetMcpMerge:
         # _get_platform_tools args: (cfg, "cron")
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
+
+
+class TestPerJobMaxIterations:
+    def test_job_can_tighten_but_not_widen_global_limit(self):
+        cfg = {"agent": {"max_turns": 60}}
+        assert _resolve_cron_max_iterations({}, cfg) == 60
+        assert _resolve_cron_max_iterations({"max_iterations": 12}, cfg) == 12
+        assert _resolve_cron_max_iterations({"max_iterations": 120}, cfg) == 60
+
+    @pytest.mark.parametrize("invalid", [0, -3, False, "broken"])
+    def test_malformed_persisted_limit_fails_closed(self, invalid):
+        with pytest.raises(ValueError, match="positive integer"):
+            _resolve_cron_max_iterations({"max_iterations": invalid}, {})
 
 
 class TestResolveOrigin:
@@ -1227,6 +1240,44 @@ class TestRunJobSessionPersistence:
 
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["enabled_toolsets"] == ["web", "terminal", "file"]
+
+    def test_run_job_passes_effective_per_job_iteration_cap_to_agent(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "agent:\n  max_turns: 60\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "bounded-job",
+            "name": "bounded",
+            "prompt": "hello",
+            "max_iterations": 12,
+        }
+        fake_db, patches = self._make_run_job_patches(tmp_path)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, *_ = run_job(job)
+
+        assert success is True
+        assert mock_agent_cls.call_args.kwargs["max_iterations"] == 12
+
+    def test_run_job_rejects_malformed_limit_before_agent_creation(self, tmp_path):
+        job = {
+            "id": "malformed-bounded-job",
+            "name": "malformed",
+            "prompt": "hello",
+            "max_iterations": 0,
+        }
+        fake_db, patches = self._make_run_job_patches(tmp_path)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            success, _output, _final_response, error = run_job(job)
+
+        assert success is False
+        assert "positive integer" in error
+        mock_agent_cls.assert_not_called()
 
     def test_run_job_disabled_toolsets_layer_user_config_on_baseline(self, tmp_path):
         """agent.disabled_toolsets must be honoured in cron — issue #25752.

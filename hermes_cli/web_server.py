@@ -91,7 +91,7 @@ try:
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
     from fastapi.staticfiles import StaticFiles
-    from pydantic import BaseModel
+    from pydantic import BaseModel, StrictInt
 except ImportError:
     # First try lazy-installing the dashboard extras. Only the user actually
     # running `hermes dashboard` needs fastapi+uvicorn; lazy install keeps
@@ -106,7 +106,7 @@ except ImportError:
         from fastapi.middleware.cors import CORSMiddleware
         from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
         from fastapi.staticfiles import StaticFiles
-        from pydantic import BaseModel
+        from pydantic import BaseModel, StrictInt
     except Exception:
         raise SystemExit(
             "Web UI requires fastapi and uvicorn.\n"
@@ -7971,6 +7971,7 @@ class CronJobCreate(BaseModel):
     context_from: Optional[Any] = None
     enabled_toolsets: Optional[List[str]] = None
     workdir: Optional[str] = None
+    max_iterations: Optional[StrictInt] = None
     no_agent: bool = False
 
 
@@ -8074,6 +8075,12 @@ def _normalize_dashboard_cron_updates(
         normalized["context_from"] = _cron_string_list(normalized["context_from"])
     if "enabled_toolsets" in normalized:
         normalized["enabled_toolsets"] = _cron_string_list(normalized["enabled_toolsets"])
+    if "max_iterations" in normalized:
+        from cron.jobs import _normalize_max_iterations
+
+        normalized["max_iterations"] = _normalize_max_iterations(
+            normalized["max_iterations"]
+        )
     return normalized
 
 
@@ -8285,6 +8292,7 @@ async def create_cron_job(body: CronJobCreate, profile: str = "default"):
             context_from=context_from,
             enabled_toolsets=_cron_string_list(body.enabled_toolsets),
             workdir=_cron_optional_text(body.workdir),
+            max_iterations=body.max_iterations,
             no_agent=no_agent,
         )
     except HTTPException:

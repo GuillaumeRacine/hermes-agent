@@ -166,6 +166,53 @@ class TestSlashCommandSessionIsolation:
         assert event.source.chat_id == "D123"
         assert event.source.user_id == "U123"
 
+    @pytest.mark.asyncio
+    async def test_slash_command_in_non_allowed_channel_is_dropped(self, adapter):
+        adapter.config.extra["allowed_channels"] = ["C_PRESENT"]
+
+        await adapter._handle_slash_command(
+            {
+                "command": "/help",
+                "user_id": "U123",
+                "channel_id": "C_OTHER",
+                "team_id": "T123",
+            }
+        )
+
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_slash_command_in_allowed_channel_is_dispatched(self, adapter):
+        adapter.config.extra["allowed_channels"] = ["C_PRESENT"]
+
+        await adapter._handle_slash_command(
+            {
+                "command": "/help",
+                "user_id": "U123",
+                "channel_id": "C_PRESENT",
+                "team_id": "T123",
+            }
+        )
+
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_slash_command_in_dm_is_dropped_when_dm_policy_disabled(
+        self, adapter
+    ):
+        adapter.config.extra["dm_policy"] = "disabled"
+
+        await adapter._handle_slash_command(
+            {
+                "command": "/help",
+                "user_id": "U123",
+                "channel_id": "D123",
+                "team_id": "T123",
+            }
+        )
+
+        adapter.handle_message.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # TestAppMentionHandler
@@ -177,12 +224,20 @@ class TestAppMentionHandler:
 
     def test_app_mention_registered_on_connect(self):
         """connect() should register message + assistant lifecycle handlers."""
-        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        config = PlatformConfig(
+            enabled=True,
+            token="xoxb-fake",
+            extra={
+                "allowed_channels": ["C_PRESENT"],
+                "dm_policy": "disabled",
+            },
+        )
         adapter = SlackAdapter(config)
 
         # Track which events get registered
         registered_events = []
         registered_commands = []
+        registered_command_handlers = []
 
         mock_app = MagicMock()
 
@@ -196,6 +251,7 @@ class TestAppMentionHandler:
         def mock_command(cmd):
             def decorator(fn):
                 registered_commands.append(cmd)
+                registered_command_handlers.append(fn)
                 return fn
 
             return decorator
@@ -257,6 +313,22 @@ class TestAppMentionHandler:
             assert slash_matcher.match(
                 expected
             ), f"Slack slash regex does not match {expected}"
+
+        # The registration wrapper must silently acknowledge an out-of-scope
+        # command before showing the usual visible "Running …" response.
+        adapter._handle_slash_command = AsyncMock()
+        ack = AsyncMock()
+        asyncio.run(
+            registered_command_handlers[0](
+                ack,
+                {
+                    "command": "/help",
+                    "channel_id": "C_OTHER",
+                },
+            )
+        )
+        ack.assert_awaited_once_with()
+        adapter._handle_slash_command.assert_not_awaited()
 
 
 class TestSlackConnectCleanup:
@@ -1959,6 +2031,23 @@ class TestMessageRouting:
         }
         await adapter._handle_slack_message(event)
         adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel_type", ["im", "mpim"])
+    async def test_disabled_dm_policy_drops_direct_messages(self, adapter, channel_type):
+        """A channel-only bot must not create sessions or answer Slack DMs."""
+        adapter.config.extra["dm_policy"] = "disabled"
+        event = {
+            "text": "hello",
+            "user": "U_USER",
+            "channel": "D123",
+            "channel_type": channel_type,
+            "ts": "1234567890.000001",
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_channel_message_requires_mention(self, adapter):

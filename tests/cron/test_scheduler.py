@@ -1573,6 +1573,56 @@ class TestRunJobSessionPersistence:
         assert "final fallback report" in output
         assert "(FAILED)" not in output
 
+    def test_run_job_rejects_failed_max_iteration_summary(self, tmp_path):
+        """A provider exception from the summary call is a failed cron run.
+
+        The internal exception must not be delivered as a successful report
+        (or copied into the sanitized failure output).
+        """
+        job = {
+            "id": "failed-summary-job",
+            "name": "failed summary",
+            "prompt": "finish the report",
+        }
+        fake_db = MagicMock()
+        raw_provider_error = (
+            "A tool_choice was set on the request but no tools were specified."
+        )
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": raw_provider_error,
+                "completed": False,
+                "failed": False,
+                "turn_exit_reason": "max_iterations_reached(60/60)",
+                "max_iteration_summary_failed": True,
+            }
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert error == (
+            "RuntimeError: agent could not generate the iteration-limit summary"
+        )
+        assert raw_provider_error not in output
+        assert "(FAILED)" in output
+
     def test_tick_marks_empty_response_as_error(self, tmp_path):
         """When run_job returns success=True but final_response is empty,
         tick() should mark the job as error so last_status != 'ok'.

@@ -1375,6 +1375,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
     print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
+    # Callers need to distinguish a real no-tools summary from this helper's
+    # emergency fallback.  In particular, cron must not deliver a provider
+    # exception as though it were a successful scheduled report.
+    agent._max_iteration_summary_failed = False
 
     summary_request = (
         "You've reached the maximum number of tool-calling iterations allowed. "
@@ -1601,7 +1605,11 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
     except Exception as e:
         logger.warning(f"Failed to get summary response: {e}")
-        final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
+        agent._max_iteration_summary_failed = True
+        final_response = (
+            f"I reached the maximum iterations ({agent.max_iterations}) "
+            "but couldn't generate a final summary."
+        )
 
     return final_response
 

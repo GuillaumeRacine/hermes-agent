@@ -3372,8 +3372,9 @@ class TestHandleMaxIterations:
         messages = [{"role": "user", "content": "do stuff"}]
         result = agent._handle_max_iterations(messages, 60)
         assert isinstance(result, str)
-        assert "error" in result.lower()
-        assert "API down" in result
+        assert "couldn't generate a final summary" in result
+        assert "API down" not in result
+        assert agent._max_iteration_summary_failed is True
 
     def test_summary_skips_reasoning_for_unsupported_openrouter_model(self, agent):
         agent.base_url = "https://openrouter.ai/api/v1"
@@ -3598,6 +3599,51 @@ class TestHandleMaxIterations:
         assert "tools" not in captured
         assert "tool_choice" not in captured
         assert "parallel_tool_calls" not in captured
+
+    def test_codex_summary_retry_strips_tool_controls_when_tools_removed(self, agent):
+        agent.api_mode = "codex_responses"
+        agent.provider = "openai-codex"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "chatgpt.com"
+        agent.model = "gpt-5.5"
+        agent._cached_system_prompt = "You are helpful."
+        captured = []
+
+        monkey_kwargs = {
+            "model": "gpt-5.5",
+            "input": [{"role": "user", "content": "do stuff"}],
+            "tools": [{"type": "function", "name": "web_search"}],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+        }
+
+        def fake_run_codex_stream(kwargs):
+            captured.append(kwargs.copy())
+            text = "" if len(captured) == 1 else "Summary after retry"
+            return SimpleNamespace(
+                status="completed",
+                output=[
+                    SimpleNamespace(
+                        type="message",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text=text)],
+                    )
+                ],
+            )
+
+        with (
+            patch.object(agent, "_build_api_kwargs", side_effect=lambda _messages: monkey_kwargs.copy()),
+            patch.object(agent, "_run_codex_stream", side_effect=fake_run_codex_stream),
+        ):
+            result = agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 90)
+
+        assert result == "Summary after retry"
+        assert len(captured) == 2
+        for request in captured:
+            assert "tools" not in request
+            assert "tool_choice" not in request
+            assert "parallel_tool_calls" not in request
 
     def test_api_sanitizer_matches_responses_call_id_when_id_differs(self, agent):
         messages = [
@@ -4984,6 +5030,33 @@ class TestRunConversation:
         assert call.kwargs.get("release_claim") is True
         assert call.kwargs.get("end_run") is True
         assert "Iteration budget exhausted" in call.kwargs.get("error", "")
+
+    def test_failed_iteration_summary_is_exposed_in_result(self, agent):
+        """The finalizer must carry the summary failure signal to callers."""
+        self._setup_agent(agent)
+        agent.max_iterations = 1
+
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tc],
+        )
+
+        def failed_summary(_messages, _api_call_count):
+            agent._max_iteration_summary_failed = True
+            return "I couldn't generate a final summary."
+
+        with (
+            patch("run_agent.handle_function_call", return_value="ok"),
+            patch.object(agent, "_handle_max_iterations", side_effect=failed_summary),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("do the work")
+
+        assert result["completed"] is False
+        assert result["turn_exit_reason"] == "max_iterations_reached(1/1)"
+        assert result["max_iteration_summary_failed"] is True
 
     def test_no_kanban_block_when_not_in_kanban_mode(self, agent, monkeypatch):
         """The exhaustion bridge must NOT fire when HERMES_KANBAN_TASK

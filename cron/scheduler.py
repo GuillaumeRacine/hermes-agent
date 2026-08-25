@@ -2636,8 +2636,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             result.get("failed") is not True
             and result.get("completed") is False
             and turn_exit_reason.startswith("max_iterations_reached(")
+            and result.get("max_iteration_summary_failed") is not True
             and bool(final_response_text)
         )
+        if result.get("max_iteration_summary_failed") is True:
+            raise RuntimeError("agent could not generate the iteration-limit summary")
         if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
             _err_text = (
                 result.get("error")

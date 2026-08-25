@@ -400,6 +400,11 @@ def finalize_turn(
         "cost_source": agent.session_cost_source,
         "session_id": agent.session_id,
     }
+    if (
+        str(_turn_exit_reason).startswith("max_iterations_reached(")
+        and getattr(agent, "_max_iteration_summary_failed", False)
+    ):
+        result["max_iteration_summary_failed"] = True
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Surface any post-loop cleanup failures so the caller can distinguish a

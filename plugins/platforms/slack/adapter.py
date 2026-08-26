@@ -57,6 +57,54 @@ from gateway.platforms.base import (
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Per-channel bot identity (hermes-home issue #97)
+#
+# One Socket Mode app (the primary ``SLACK_BOT_TOKEN``) receives events, but a
+# channel may be owned by a *different* bot identity in the same workspace.
+# ``SLACK_CHANNEL_BOT_TOKENS`` maps channel ids to the bot token that must be
+# used for every outbound post to that channel, e.g.::
+#
+#     SLACK_CHANNEL_BOT_TOKENS=C0B3CTXLCE8=PRESENT_SLACK_BOT_TOKEN
+#
+# The right-hand side is either a literal ``xoxb-`` token or the *name* of an
+# env var holding one (preferred — keeps the map free of secrets). Channels not
+# in the map use the primary token. The multi-workspace ``_team_clients`` map
+# cannot express this because both identities share one ``team_id``.
+# ---------------------------------------------------------------------------
+CHANNEL_BOT_TOKENS_ENV = "SLACK_CHANNEL_BOT_TOKENS"
+
+
+def parse_channel_bot_tokens(
+    raw: Optional[str], env: Optional[Dict[str, str]] = None
+) -> Dict[str, str]:
+    """Parse ``C123=ENV_NAME_OR_TOKEN,C456=...`` into ``{channel_id: token}``.
+
+    Entries with an empty/unresolvable token are dropped (never fall back to a
+    different identity silently — the caller logs and uses the primary token).
+    """
+    env = os.environ if env is None else env
+    result: Dict[str, str] = {}
+    for entry in (raw or "").split(","):
+        entry = entry.strip()
+        if not entry or "=" not in entry:
+            continue
+        channel_id, value = entry.split("=", 1)
+        channel_id, value = channel_id.strip(), value.strip()
+        if not channel_id:
+            continue
+        token = value if value.startswith("xox") else (env.get(value, "") or "").strip()
+        if token:
+            result[channel_id] = token
+    return result
+
+
+def resolve_channel_bot_token(chat_id: str, env: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Return the channel-scoped bot token for ``chat_id`` or ``None``."""
+    env = os.environ if env is None else env
+    return parse_channel_bot_tokens(env.get(CHANNEL_BOT_TOKENS_ENV, ""), env).get(chat_id)
+
 # ContextVar carrying the user_id of the slash-command invoker.
 # Set in _handle_slash_command, read in send() to match the correct
 # stashed response_url when multiple users issue commands on the same
@@ -433,6 +481,9 @@ class SlackAdapter(BasePlatformAdapter):
         self._team_clients: Dict[str, Any] = {}  # team_id → WebClient
         self._team_bot_user_ids: Dict[str, str] = {}  # team_id → bot_user_id
         self._channel_team: Dict[str, str] = {}  # channel_id → team_id
+        # channel_id → WebClient for channels owned by another bot identity
+        # (see ``parse_channel_bot_tokens``). Checked before ``_team_clients``.
+        self._channel_clients: Dict[str, Any] = {}
         # Dedup cache: prevents duplicate bot responses when Socket Mode
         # reconnects redeliver events.
         self._dedup = MessageDeduplicator()
@@ -929,6 +980,7 @@ class SlackAdapter(BasePlatformAdapter):
             self._bot_user_id = None
             self._team_clients = {}
             self._team_bot_user_ids = {}
+            self._channel_clients = {}
 
             # First token is the primary — used for AsyncApp / Socket Mode
             primary_token = bot_tokens[0]
@@ -959,6 +1011,34 @@ class SlackAdapter(BasePlatformAdapter):
                     bot_name,
                     team_name,
                     team_id,
+                )
+
+            # Channel-scoped identities: a channel may be owned by a different
+            # bot in the same workspace (#97: PresentAgent owns #present). The
+            # token is verified up front; an invalid token is logged loudly and
+            # the channel falls back to the primary identity so scheduled
+            # deliveries are never dropped silently.
+            for channel_id, token in parse_channel_bot_tokens(
+                os.getenv(CHANNEL_BOT_TOKENS_ENV, "")
+            ).items():
+                client = AsyncWebClient(token=token)
+                _apply_slack_proxy(client, proxy_url)
+                try:
+                    auth_response = await client.auth_test()
+                except Exception as exc:  # noqa: BLE001 - fail loud, keep primary
+                    logger.error(
+                        "[Slack] Channel-scoped bot token for %s rejected (%s); "
+                        "falling back to primary identity for that channel",
+                        channel_id,
+                        exc,
+                    )
+                    continue
+                self._channel_clients[channel_id] = client
+                logger.info(
+                    "[Slack] Channel %s posts as @%s (%s)",
+                    channel_id,
+                    auth_response.get("user", "unknown"),
+                    auth_response.get("user_id", ""),
                 )
 
             # Register message event handler
@@ -1220,7 +1300,10 @@ class SlackAdapter(BasePlatformAdapter):
         logger.info("[Slack] Disconnected")
 
     def _get_client(self, chat_id: str) -> Any:
-        """Return the workspace-specific WebClient for a channel."""
+        """Return the WebClient for a channel (channel identity > workspace)."""
+        channel_client = self._channel_clients.get(chat_id)
+        if channel_client is not None:
+            return channel_client
         team_id = self._channel_team.get(chat_id)
         if team_id and team_id in self._team_clients:
             return self._team_clients[team_id]
@@ -4204,7 +4287,11 @@ async def _standalone_send(
     throwaway ``SlackAdapter`` instance's ``format_message`` — so cron-delivered
     Slack messages render identically to gateway-delivered ones.
     """
-    token = getattr(pconfig, "token", None) or os.getenv("SLACK_BOT_TOKEN", "")
+    token = (
+        resolve_channel_bot_token(chat_id)
+        or getattr(pconfig, "token", None)
+        or os.getenv("SLACK_BOT_TOKEN", "")
+    )
     if not token:
         return {"error": "Slack send failed: SLACK_BOT_TOKEN not configured"}
 

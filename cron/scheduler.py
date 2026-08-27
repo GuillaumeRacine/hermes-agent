@@ -65,14 +65,14 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
         elif "quota" in lower:
             reason = "quota limit"
         return (
-            f"⚠️ Cron '{job_name}' failed: provider {reason}. "
+            f"Cron '{job_name}' failed: provider {reason}. "
             "Fallback chain was exhausted or unavailable. "
             "Full details saved in cron output."
         )
 
     if "readtimeout" in lower or "timed out" in lower or "timeout" in lower:
         return (
-            f"⚠️ Cron '{job_name}' failed: provider timeout. "
+            f"Cron '{job_name}' failed: provider timeout. "
             "Fallback chain was exhausted or unavailable. "
             "Full details saved in cron output."
         )
@@ -82,7 +82,7 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     # not trip a misleading auth message.
     if re.search(r"authenticat|authoriz", lower) or re.search(r"\b(401|403)\b", text):
         return (
-            f"⚠️ Cron '{job_name}' failed: provider authentication error. "
+            f"Cron '{job_name}' failed: provider authentication error. "
             "Full details saved in cron output."
         )
 
@@ -96,7 +96,45 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if len(cleaned) > 180:
         cleaned = cleaned[:177].rstrip() + "..."
-    return f"⚠️ Cron '{job_name}' failed: {cleaned}"
+    return f"Cron '{job_name}' failed: {cleaned}"
+
+
+def _should_deliver_cron_failure(job: dict, error: str | None) -> bool:
+    """Deliver only the first alert for an unchanged consecutive failure.
+
+    The detailed failure is still saved and last_error is still updated on every
+    run. Chat delivery is reserved for state changes so a 15-minute cron cannot
+    flood an ops channel with the same stack trace headline all week.
+    """
+    if (job.get("last_status") or "").lower() not in {"error", "failed", "failure"}:
+        return True
+    previous_error = job.get("last_error")
+    if not previous_error:
+        return True
+    return _summarize_cron_failure_for_delivery(job, previous_error) != _summarize_cron_failure_for_delivery(job, error)
+
+
+def _resolve_job_max_iterations(job: dict, cfg: dict | None) -> int:
+    """Per-job iteration budget with the config value as a hard ceiling.
+
+    jobs.json `max_iterations` was previously ignored (only config max_turns was
+    read), so every agent job inherited the same global budget. A job may now
+    declare a smaller budget by action class; it can never exceed the config cap.
+    """
+    cfg = cfg or {}
+    config_cap = cfg.get("agent", {}).get("max_turns") or cfg.get("max_turns") or 90
+    try:
+        config_cap = int(config_cap)
+    except (TypeError, ValueError):
+        config_cap = 90
+    raw = job.get("max_iterations") if isinstance(job, dict) else None
+    try:
+        per_job = int(raw) if raw not in (None, "", 0) else None
+    except (TypeError, ValueError):
+        per_job = None
+    if per_job is None or per_job < 1:
+        return config_cap
+    return min(per_job, config_cap)
 
 
 class CronPromptInjectionBlocked(Exception):
@@ -1803,7 +1841,9 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     except subprocess.TimeoutExpired:
         return False, f"Script timed out after {script_timeout}s: {path}"
     except Exception as exc:
-        return False, f"Script execution failed: {exc}"
+        # Include exception type so bare KeyError('HERMES_KANBAN_BOARD') style
+        # failures are debuggable in cron output / watchdog signatures.
+        return False, f"Script execution failed: {type(exc).__name__}: {exc}"
 
 
 def _parse_wake_gate(script_output: str) -> bool:
@@ -2473,8 +2513,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        # Max iterations: per-job budget (jobs.json `max_iterations`) wins, capped by config.
+        max_iterations = _resolve_job_max_iterations(job, _cfg)
+        logger.info("Job '%s': max_iterations=%s (job=%s, config=%s)", job_id, max_iterations,
+                    job.get("max_iterations"), _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns"))
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -2924,6 +2966,12 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # responses: do not deliver a blank message, and let the
         # empty-response guard below mark the run as a soft failure.
         should_deliver = bool(deliver_content.strip())
+        if should_deliver and not success and not _should_deliver_cron_failure(job, error):
+            logger.info(
+                "Job '%s': unchanged consecutive failure — skipping duplicate delivery",
+                job["id"],
+            )
+            should_deliver = False
         # Cron silence suppression — see _is_cron_silence_response.  Replaces the
         # old `SILENT_MARKER in ...upper()` substring check, which both leaked
         # bracketless near-markers ("SILENT" / "NO_REPLY") and wrongly swallowed

@@ -1713,6 +1713,37 @@ class TestForegroundKeyboardRouting:
         assert key_args["window_id"] == 9040
         assert "delivery_mode" not in key_args
 
+    def test_same_app_capture_preserves_exact_raised_window(self):
+        """A redundant app filter must not hop across duplicate app PIDs."""
+        windows = [
+            {"app_name": "Google Chrome", "pid": 45899, "window_id": 9040,
+             "is_on_screen": True, "title": "Other profile", "z_index": 0},
+            {"app_name": "Google Chrome", "pid": 29435, "window_id": 9177,
+             "is_on_screen": True, "title": "Authorized draft", "z_index": 1},
+        ]
+        backend = _make_cua_backend_with_windows(windows)
+        backend._active_pid = 29435
+        backend._active_window_id = 9177
+        backend._last_app = "Google Chrome"
+        backend._foreground_input = True
+        backend._session.call_tool.side_effect = [
+            self._result(windows=windows),
+            self._result(message="✅ Google Chrome — 0 elements\n"),
+            self._result(),
+        ]
+
+        backend.capture(mode="ax", app="Google Chrome")
+        pressed = backend.key("return")
+
+        assert pressed.ok
+        capture_args = backend._session.call_tool.call_args_list[1].args[1]
+        assert capture_args["pid"] == 29435
+        assert capture_args["window_id"] == 9177
+        key_args = backend._session.call_tool.call_args_list[2].args[1]
+        assert key_args["pid"] == 29435
+        assert key_args["window_id"] == 9177
+        assert key_args["delivery_mode"] == "foreground"
+
 
 class TestCuaEnvironmentScrubbing:
     """Verify that cua-driver subprocess environment is sanitized (issue #37878)."""

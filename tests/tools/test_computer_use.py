@@ -1581,6 +1581,62 @@ class TestFocusAppFilterNoMatch:
         assert backend._active_window_id == 2
 
 
+class TestKeyboardWindowRouting:
+    """Keyboard actions must retain the window selected by focus/capture."""
+
+    @staticmethod
+    def _backend_with_active_target():
+        from tools.computer_use.cua_backend import CuaDriverBackend
+
+        backend = CuaDriverBackend()
+        backend._session = MagicMock()
+        backend._session.call_tool.return_value = {
+            "data": "ok",
+            "images": [],
+            "structuredContent": None,
+            "isError": False,
+        }
+        backend._session.supports_capability = lambda cap, tool=None: False
+        backend._active_pid = 45899
+        backend._active_window_id = 9040
+        return backend
+
+    def test_type_text_targets_selected_window(self):
+        backend = self._backend_with_active_target()
+
+        result = backend.type_text("https://example.com")
+
+        assert result.ok
+        name, args = backend._session.call_tool.call_args.args
+        assert name == "type_text"
+        assert args["pid"] == 45899
+        assert args["window_id"] == 9040
+
+    def test_hotkey_targets_selected_window(self):
+        backend = self._backend_with_active_target()
+
+        result = backend.key("cmd+l")
+
+        assert result.ok
+        name, args = backend._session.call_tool.call_args.args
+        assert name == "hotkey"
+        assert args["pid"] == 45899
+        assert args["window_id"] == 9040
+        assert args["keys"] == ["cmd", "l"]
+
+    def test_plain_key_targets_selected_window(self):
+        backend = self._backend_with_active_target()
+
+        result = backend.key("return")
+
+        assert result.ok
+        name, args = backend._session.call_tool.call_args.args
+        assert name == "press_key"
+        assert args["pid"] == 45899
+        assert args["window_id"] == 9040
+        assert args["key"] == "return"
+
+
 class TestCuaEnvironmentScrubbing:
     """Verify that cua-driver subprocess environment is sanitized (issue #37878)."""
 

@@ -1359,7 +1359,10 @@ class CuaDriverBackend(ComputerUseBackend):
         if pid is None:
             return ActionResult(ok=False, action="type_text",
                                 message="No active window — call capture() first.")
-        return self._action("type_text", {"pid": pid, "text": text})
+        args: Dict[str, Any] = {"pid": pid, "text": text}
+        if self._active_window_id is not None:
+            args["window_id"] = self._active_window_id
+        return self._action("type_text", args)
 
     def key(self, keys: str) -> ActionResult:
         pid = self._active_pid
@@ -1372,11 +1375,17 @@ class CuaDriverBackend(ComputerUseBackend):
             return ActionResult(ok=False, action="key",
                                 message=f"Could not parse key from '{keys}'.")
 
+        args: Dict[str, Any] = {"pid": pid}
+        if self._active_window_id is not None:
+            args["window_id"] = self._active_window_id
+
         if modifiers:
             # hotkey requires at least one modifier + one key.
-            return self._action("hotkey", {"pid": pid, "keys": modifiers + [key_name]})
+            args["keys"] = modifiers + [key_name]
+            return self._action("hotkey", args)
         else:
-            return self._action("press_key", {"pid": pid, "key": key_name})
+            args["key"] = key_name
+            return self._action("press_key", args)
 
     # ── Value setter ────────────────────────────────────────────────
     def set_value(self, value: str, element: Optional[int] = None) -> ActionResult:

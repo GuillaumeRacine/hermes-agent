@@ -1637,6 +1637,83 @@ class TestKeyboardWindowRouting:
         assert args["key"] == "return"
 
 
+class TestForegroundKeyboardRouting:
+    """Explicit raised focus enables safe keyboard input for multi-window apps."""
+
+    @staticmethod
+    def _windows():
+        return [
+            {"app_name": "Google Chrome", "pid": 45899, "window_id": 9040,
+             "is_on_screen": True, "title": "Draft", "z_index": 0},
+        ]
+
+    @staticmethod
+    def _result(*, is_error=False, message="ok", windows=None):
+        return {
+            "data": message,
+            "images": [],
+            "structuredContent": {"windows": windows} if windows is not None else None,
+            "isError": is_error,
+        }
+
+    def test_raised_focus_uses_exact_window_and_foreground_delivery(self):
+        backend = _make_cua_backend_with_windows(self._windows())
+        backend._session.call_tool.side_effect = [
+            self._result(windows=self._windows()),
+            self._result(),
+            self._result(),
+            self._result(),
+            self._result(),
+        ]
+
+        result = backend.focus_app("Google Chrome", raise_window=True)
+        typed = backend.type_text("https://example.com")
+        hotkey = backend.key("cmd+l")
+        plain_key = backend.key("return")
+
+        assert result.ok and typed.ok and hotkey.ok and plain_key.ok
+        calls = backend._session.call_tool.call_args_list
+        assert calls[1].args[0] == "bring_to_front"
+        assert calls[1].args[1]["pid"] == 45899
+        assert calls[1].args[1]["window_id"] == 9040
+        for call in calls[2:]:
+            assert call.args[1]["pid"] == 45899
+            assert call.args[1]["window_id"] == 9040
+            assert call.args[1]["delivery_mode"] == "foreground"
+
+    def test_failed_raise_does_not_arm_foreground_delivery(self):
+        backend = _make_cua_backend_with_windows(self._windows())
+        backend._session.call_tool.side_effect = [
+            self._result(windows=self._windows()),
+            self._result(is_error=True, message="fronting denied"),
+            self._result(),
+        ]
+
+        result = backend.focus_app("Google Chrome", raise_window=True)
+        backend.type_text("safe fallback")
+
+        assert result.ok is False
+        type_args = backend._session.call_tool.call_args_list[2].args[1]
+        assert type_args["window_id"] == 9040
+        assert "delivery_mode" not in type_args
+
+    def test_background_focus_resets_prior_foreground_mode(self):
+        backend = _make_cua_backend_with_windows(self._windows())
+        backend._foreground_input = True
+        backend._session.call_tool.side_effect = [
+            self._result(windows=self._windows()),
+            self._result(),
+        ]
+
+        result = backend.focus_app("Google Chrome", raise_window=False)
+        backend.key("return")
+
+        assert result.ok
+        key_args = backend._session.call_tool.call_args_list[1].args[1]
+        assert key_args["window_id"] == 9040
+        assert "delivery_mode" not in key_args
+
+
 class TestCuaEnvironmentScrubbing:
     """Verify that cua-driver subprocess environment is sanitized (issue #37878)."""
 

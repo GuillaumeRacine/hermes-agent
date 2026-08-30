@@ -924,6 +924,13 @@ DEFAULT_CONFIG = {
     "max_live_sessions": 16,
     "agent": {
         "max_turns": 90,
+        # One-shot (`hermes -z`) post-tool return-path watchdog. After a tool
+        # batch finishes, bound only the next model-response wait to this many
+        # seconds. Tool execution is never timed out by this setting. If the
+        # response stalls, one-shot exits nonzero with a resumable session ID.
+        # Values below 30 seconds are floored to 30 to avoid false positives on
+        # normal provider prefill/reasoning.
+        "oneshot_return_timeout_seconds": 300,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has

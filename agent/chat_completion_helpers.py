@@ -140,6 +140,21 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _oneshot_return_timeout_error(agent):
+    """Return a typed error when the active one-shot deadline has elapsed."""
+    deadline = getattr(agent, "_oneshot_return_deadline", None)
+    if deadline is None or time.monotonic() < float(deadline):
+        return None
+    from agent.errors import OneShotReturnTimeoutError
+
+    return OneShotReturnTimeoutError(
+        session_id=getattr(agent, "session_id", None) or "unknown",
+        timeout_seconds=float(
+            getattr(agent, "_oneshot_return_timeout_seconds", 0) or 0
+        ),
+    )
+
+
 def interruptible_api_call(agent, api_kwargs: dict):
     """
     Run the API call in a background thread so the main conversation loop
@@ -379,6 +394,25 @@ def interruptible_api_call(agent, api_kwargs: dict):
     while t.is_alive():
         t.join(timeout=0.3)
         _poll_count += 1
+
+        if not t.is_alive():
+            break
+
+        _oneshot_error = _oneshot_return_timeout_error(agent)
+        if _oneshot_error is not None:
+            _request_cancelled["value"] = True
+            try:
+                if agent.api_mode == "anthropic_messages":
+                    agent._anthropic_client.close()
+                    agent._rebuild_anthropic_client()
+                else:
+                    _close_request_client_once("oneshot_return_timeout")
+            except Exception:
+                pass
+            t.join(timeout=2.0)
+            result["error"] = _oneshot_error
+            agent._touch_activity("one-shot post-tool return path timed out")
+            break
 
         # Touch activity every ~30s so the gateway's inactivity
         # monitor knows we're alive while waiting for the response.
@@ -1764,6 +1798,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         t.start()
         while t.is_alive():
             t.join(timeout=0.3)
+            if not t.is_alive():
+                break
+            _oneshot_error = _oneshot_return_timeout_error(agent)
+            if _oneshot_error is not None:
+                result["error"] = _oneshot_error
+                agent._touch_activity("one-shot post-tool return path timed out")
+                break
             if agent._interrupt_requested:
                 raise InterruptedError("Agent interrupted during Bedrock API call")
         if result["error"] is not None:
@@ -2630,6 +2671,25 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     while t.is_alive():
         t.join(timeout=0.3)
 
+        if not t.is_alive():
+            break
+
+        _oneshot_error = _oneshot_return_timeout_error(agent)
+        if _oneshot_error is not None:
+            _request_cancelled["value"] = True
+            try:
+                if agent.api_mode == "anthropic_messages":
+                    agent._anthropic_client.close()
+                    agent._rebuild_anthropic_client()
+                else:
+                    _close_request_client_once("oneshot_return_timeout")
+            except Exception:
+                pass
+            t.join(timeout=2.0)
+            result["error"] = _oneshot_error
+            agent._touch_activity("one-shot post-tool return path timed out")
+            break
+
         # Periodic heartbeat: touch the agent's activity tracker so the
         # gateway's inactivity monitor knows we're alive while waiting
         # for stream chunks.  Without this, long thinking pauses (e.g.
@@ -2701,6 +2761,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 pass
             raise InterruptedError("Agent interrupted during streaming API call")
     if result["error"] is not None:
+        from agent.errors import OneShotReturnTimeoutError
+
+        if isinstance(result["error"], OneShotReturnTimeoutError):
+            raise result["error"]
         if deltas_were_sent["yes"]:
             # Streaming failed AFTER some tokens were already delivered to
             # the platform.  Re-raising would let the outer retry loop make

@@ -22,12 +22,65 @@ Env var fallbacks (used when the corresponding arg is not passed):
 from __future__ import annotations
 
 import logging
+import json
 import os
 import sys
+from datetime import datetime, timezone
 from contextlib import redirect_stderr, redirect_stdout
 from typing import Optional
 
 from hermes_cli.fallback_config import get_fallback_chain
+
+
+def _oneshot_return_timeout_seconds(cfg: dict) -> float:
+    """Resolve the bounded post-tool response timeout for one-shot mode."""
+    agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
+    raw = (
+        agent_cfg.get("oneshot_return_timeout_seconds", 300)
+        if isinstance(agent_cfg, dict)
+        else 300
+    )
+    try:
+        return max(30.0, float(raw))
+    except (TypeError, ValueError):
+        return 300.0
+
+
+def _record_return_path_incident(error: BaseException) -> None:
+    """Append privacy-safe one-shot return-path telemetry, best effort."""
+    try:
+        from agent.errors import OneShotReturnTimeoutError
+        from hermes_cli.config import get_hermes_home
+
+        if not isinstance(error, OneShotReturnTimeoutError):
+            return
+        log_dir = get_hermes_home() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        record = {
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "event": "oneshot_return_timeout",
+            "return_path_outcome": "timed_out",
+            # Never infer that tool side effects succeeded merely because the
+            # return path stalled. The quality loop can reconcile that outcome
+            # independently from durable task artifacts.
+            "implementation_outcome": "not_inferred",
+            "session_id": error.session_id,
+            "timeout_seconds": error.timeout_seconds,
+            "recoverable": error.session_id != "unknown",
+        }
+        payload = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+        fd = os.open(
+            log_dir / "oneshot-return-incidents.jsonl",
+            os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+            0o600,
+        )
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+    except Exception:
+        # Telemetry must never hide the actionable stderr failure.
+        pass
 
 
 def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
@@ -209,6 +262,7 @@ def run_oneshot(
         # (Ctrl-C / explicit sys.exit() inside the agent).
         if isinstance(failure, (KeyboardInterrupt, SystemExit)):
             raise failure
+        _record_return_path_incident(failure)
         real_stderr.write(f"hermes -z: agent failed: {failure}\n")
         real_stderr.flush()
         return 1
@@ -357,6 +411,11 @@ def _run_agent(
         #   - skill secret capture → returns gracefully when no callback set
         clarify_callback=_oneshot_clarify_callback,
     )
+
+    # Conversation-loop and provider-call watchdogs consult these attributes.
+    # The deadline itself is armed only after a completed tool batch.
+    agent._oneshot_return_timeout_seconds = _oneshot_return_timeout_seconds(cfg)
+    agent._oneshot_return_deadline = None
 
     # Belt-and-braces: make sure AIAgent doesn't invoke any streaming
     # display callbacks that would bypass our stdout capture.

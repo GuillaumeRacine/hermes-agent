@@ -1107,7 +1107,26 @@ class CuaDriverBackend(ComputerUseBackend):
                     ),
                     png_bytes_len=0,
                 )
-            windows = filtered
+            # A successful raised focus is an explicit exact-window choice.
+            # Repeating capture(app="...") must not silently replace that
+            # sticky target with another process/window that happens to share
+            # the same app name and is currently earlier in z-order. This is
+            # common with multiple Chrome instances. Preserve the exact raised
+            # target while it is still present; if it disappeared, the normal
+            # selection below chooses a replacement and disarms foreground
+            # input through the target-change guard.
+            sticky = None
+            if self._foreground_input:
+                sticky = next((
+                    w for w in filtered
+                    if w["pid"] == self._active_pid
+                    and w["window_id"] == self._active_window_id
+                ), None)
+            windows = (
+                [sticky] + [w for w in filtered if w is not sticky]
+                if sticky is not None
+                else filtered
+            )
 
         # Pick first on-screen window (sorted by z_index / z-order above).
         target = next((w for w in windows if not w["off_screen"]), windows[0])

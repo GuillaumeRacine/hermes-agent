@@ -2641,6 +2641,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         )
         if result.get("max_iteration_summary_failed") is True:
             raise RuntimeError("agent could not generate the iteration-limit summary")
+        if max_iteration_summary and job.get("require_completed") is True:
+            raise RuntimeError(
+                "agent reached the iteration limit before completing this strict cron job"
+            )
         if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
             _err_text = (
                 result.get("error")

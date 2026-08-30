@@ -923,6 +923,10 @@ class CuaDriverBackend(ComputerUseBackend):
         self._active_pid: Optional[int] = None
         self._active_window_id: Optional[int] = None
         self._last_app: Optional[str] = None  # last app name targeted via capture/focus_app
+        # Keyboard input stays in cua-driver's non-disruptive background mode
+        # unless the caller explicitly selected focus_app(raise_window=True)
+        # and bring_to_front succeeded for the exact sticky target.
+        self._foreground_input = False
         # Surface 6 of NousResearch/hermes-agent#47072: per-snapshot
         # `element_index -> element_token` map populated on capture().
         # Action tools (click/scroll/set_value/...) attach the matching
@@ -1107,8 +1111,11 @@ class CuaDriverBackend(ComputerUseBackend):
 
         # Pick first on-screen window (sorted by z_index / z-order above).
         target = next((w for w in windows if not w["off_screen"]), windows[0])
+        previous_target = (self._active_pid, self._active_window_id)
         self._active_pid = target["pid"]
         self._active_window_id = target["window_id"]
+        if previous_target != (self._active_pid, self._active_window_id):
+            self._foreground_input = False
         app_name = target["app_name"]
         # Record the resolved app name so capture_after= follow-ups can re-target
         # the same app rather than falling back to the frontmost window.
@@ -1362,6 +1369,8 @@ class CuaDriverBackend(ComputerUseBackend):
         args: Dict[str, Any] = {"pid": pid, "text": text}
         if self._active_window_id is not None:
             args["window_id"] = self._active_window_id
+        if self._foreground_input:
+            args["delivery_mode"] = "foreground"
         return self._action("type_text", args)
 
     def key(self, keys: str) -> ActionResult:
@@ -1378,6 +1387,8 @@ class CuaDriverBackend(ComputerUseBackend):
         args: Dict[str, Any] = {"pid": pid}
         if self._active_window_id is not None:
             args["window_id"] = self._active_window_id
+        if self._foreground_input:
+            args["delivery_mode"] = "foreground"
 
         if modifiers:
             # hotkey requires at least one modifier + one key.
@@ -1425,18 +1436,23 @@ class CuaDriverBackend(ComputerUseBackend):
         return []
 
     def focus_app(self, app: str, raise_window: bool = False) -> ActionResult:
-        """Target an app for subsequent actions without stealing system focus.
+        """Target an app and optionally make foreground keyboard delivery explicit.
 
-        cua-driver background-automation never needs to bring a window to the
-        front: capture(app=...) already selects the right window via
-        list_windows. We implement focus_app as a pure window-selector —
-        enumerate on-screen windows, find the best match for *app*, and store
-        its pid/window_id so that subsequent click/type calls hit the right
-        process.
+        ``capture(app=...)`` already selects the right window for background
+        actions. ``focus_app`` keeps that selector behavior by default, while
+        allowing an explicit raised focus for keyboard input that cua-driver
+        cannot route safely in the background.
 
-        raise_window=True is intentionally ignored: stealing the user's focus
-        is exactly what this backend is designed to avoid.
+        Background selection remains the default. When ``raise_window=True``,
+        bring the exact selected PID/window to front and arm foreground
+        delivery for later keyboard calls. cua-driver requires that explicit
+        mode when one process owns multiple eligible top-level windows; without
+        it, process-scoped keyboard delivery correctly fails closed as
+        ambiguous.
         """
+        # A new focus request always disarms prior foreground authority. It is
+        # re-enabled only after a fresh, successful bring_to_front below.
+        self._foreground_input = False
         lw_out = self._session.call_tool(
             "list_windows",
             {"on_screen_only": True, "session": self._session_id},
@@ -1464,6 +1480,31 @@ class CuaDriverBackend(ComputerUseBackend):
             self._active_pid = target["pid"]
             self._active_window_id = target["window_id"]
             self._last_app = target["app_name"]  # preserve for capture_after= follow-ups
+            if raise_window:
+                raised = self._action("bring_to_front", {
+                    "pid": self._active_pid,
+                    "window_id": self._active_window_id,
+                })
+                if not raised.ok:
+                    return ActionResult(
+                        ok=False,
+                        action="focus_app",
+                        message=(
+                            f"Selected {target['app_name']} (pid {self._active_pid}, "
+                            f"window {self._active_window_id}) but could not bring it "
+                            f"to front: {raised.message or 'unknown cua-driver error'}"
+                        ),
+                    )
+                self._foreground_input = True
+                return ActionResult(
+                    ok=True,
+                    action="focus_app",
+                    message=(
+                        f"Targeted {target['app_name']} (pid {self._active_pid}, "
+                        f"window {self._active_window_id}) and brought it to front "
+                        "for explicit foreground input."
+                    ),
+                )
             return ActionResult(
                 ok=True, action="focus_app",
                 message=f"Targeted {target['app_name']} (pid {self._active_pid}, "

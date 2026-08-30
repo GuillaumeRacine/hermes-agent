@@ -73,6 +73,20 @@ logger = logging.getLogger(__name__)
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
 
+def _arm_oneshot_return_deadline(agent: Any, messages: list) -> None:
+    """Arm one-shot's post-tool model deadline without covering tools."""
+    timeout = getattr(agent, "_oneshot_return_timeout_seconds", None)
+    last_is_tool = bool(
+        messages
+        and isinstance(messages[-1], dict)
+        and messages[-1].get("role") == "tool"
+    )
+    if timeout and last_is_tool and not getattr(agent, "_executing_tools", False):
+        agent._oneshot_return_deadline = time.monotonic() + float(timeout)
+    else:
+        agent._oneshot_return_deadline = None
+
+
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
     """Extract a provider-reported image dimension ceiling, if present."""
     parts = []
@@ -617,6 +631,13 @@ def run_conversation(
         api_call_count += 1
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")
+
+        # `hermes -z` needs a bounded return path after side effects finish.
+        # Arm the deadline only when the immediately preceding durable message
+        # is a tool result. It therefore covers provider/model waiting, never
+        # the tool batch itself. Retries within this API iteration share one
+        # deadline rather than multiplying the configured timeout.
+        _arm_oneshot_return_deadline(agent, messages)
 
         # Grace call: the budget is exhausted but we gave the model one
         # more chance.  Consume the grace flag so the loop exits after
@@ -2029,6 +2050,16 @@ def run_conversation(
                 break
 
             except Exception as api_error:
+                from agent.errors import OneShotReturnTimeoutError
+
+                if isinstance(api_error, OneShotReturnTimeoutError):
+                    # Fail closed without provider retries/fallbacks that would
+                    # multiply the terminal wait. Tool results were persisted
+                    # before execution and are resumable via the session ID in
+                    # the exception.
+                    agent._persist_session(messages, conversation_history)
+                    raise
+
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:
@@ -4225,6 +4256,9 @@ def run_conversation(
                     except Exception:
                         pass
 
+                # The model-return deadline must never cover active tools. A
+                # later post-tool model iteration will arm a fresh deadline.
+                agent._oneshot_return_deadline = None
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
                 if agent._tool_guardrail_halt_decision is not None:
@@ -4705,6 +4739,15 @@ def run_conversation(
                 break
             
         except Exception as e:
+            from agent.errors import OneShotReturnTimeoutError
+
+            if isinstance(e, OneShotReturnTimeoutError):
+                # Preserve the typed return-path failure all the way to the
+                # one-shot wrapper. Converting it into an ordinary model error
+                # here would re-enter the outer loop and lose the nonzero,
+                # resumable failure contract.
+                raise
+
             error_msg = f"Error during OpenAI-compatible API call #{api_call_count}: {str(e)}"
             try:
                 print(f"❌ {error_msg}")

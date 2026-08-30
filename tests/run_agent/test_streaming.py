@@ -4,6 +4,8 @@ Tests the unified streaming API call, delta callbacks, tool-call
 suppression, provider fallback, and CLI streaming display.
 """
 from types import SimpleNamespace
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -94,6 +96,50 @@ class TestStreamingAccumulator:
         assert response.choices[0].finish_reason == "stop"
         assert response.usage is not None
         assert response.usage.completion_tokens == 3
+
+    @patch("run_agent.AIAgent._abort_request_openai_client")
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_post_tool_oneshot_deadline_bounds_hung_stream(
+        self, mock_close, mock_create, mock_abort
+    ):
+        """A hung final model stream exits without extending into retries."""
+        from agent.errors import OneShotReturnTimeoutError
+        from run_agent import AIAgent
+
+        release = threading.Event()
+
+        def _hung_stream():
+            release.wait(timeout=5)
+            if False:
+                yield None
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = _hung_stream()
+        mock_create.return_value = mock_client
+        mock_abort.side_effect = lambda *_args, **_kwargs: release.set()
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+        agent._oneshot_return_timeout_seconds = 0.05
+        agent._oneshot_return_deadline = time.monotonic() + 0.05
+
+        started = time.monotonic()
+        with pytest.raises(OneShotReturnTimeoutError) as exc:
+            agent._interruptible_streaming_api_call({"model": "test/model"})
+
+        assert time.monotonic() - started < 1.0
+        assert exc.value.session_id == agent.session_id
+        assert mock_abort.call_count == 1
+        assert mock_create.call_count == 1
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")

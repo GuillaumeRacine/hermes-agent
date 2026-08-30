@@ -1,4 +1,5 @@
 from argparse import Namespace
+import json
 import os
 from pathlib import Path
 import sys
@@ -678,6 +679,42 @@ def test_oneshot_fails_closed_on_agent_exception(monkeypatch, capsys):
     assert "not a TTY" in captured.err
 
 
+def test_oneshot_return_timeout_is_recorded_and_resumable(
+    monkeypatch, capsys, tmp_path
+):
+    _stub_plugin_discovery(monkeypatch)
+    import hermes_cli.config as config_mod
+    import hermes_cli.oneshot as oneshot_mod
+    from agent.errors import OneShotReturnTimeoutError
+
+    def _timeout(*_args, **_kwargs):
+        raise OneShotReturnTimeoutError(
+            session_id="session-proof-123",
+            timeout_seconds=30,
+        )
+
+    monkeypatch.setattr(oneshot_mod, "_run_agent", _timeout)
+    monkeypatch.setattr(config_mod, "get_hermes_home", lambda: tmp_path)
+
+    assert oneshot_mod.run_oneshot("finish and summarize") == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "session-proof-123" in captured.err
+    assert "hermes --resume session-proof-123" in captured.err
+
+    incident_path = tmp_path / "logs" / "oneshot-return-incidents.jsonl"
+    incident = json.loads(incident_path.read_text(encoding="utf-8"))
+    assert incident == {
+        "event": "oneshot_return_timeout",
+        "implementation_outcome": "not_inferred",
+        "recorded_at": incident["recorded_at"],
+        "recoverable": True,
+        "return_path_outcome": "timed_out",
+        "session_id": "session-proof-123",
+        "timeout_seconds": 30.0,
+    }
+
+
 def test_oneshot_reraises_keyboard_interrupt(monkeypatch):
     _stub_plugin_discovery(monkeypatch)
     import hermes_cli.oneshot as oneshot_mod
@@ -802,6 +839,7 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     class FakeAgent:
         def __init__(self, **kwargs):
             captured.update(kwargs)
+            captured["agent"] = self
             self.suppress_status_output = False
             self.stream_delta_callback = object()
             self.tool_gen_callback = object()
@@ -825,7 +863,13 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "hermes_cli.config",
-        mod("hermes_cli.config", load_config=lambda: {"model": {"default": "m"}}),
+        mod(
+            "hermes_cli.config",
+            load_config=lambda: {
+                "model": {"default": "m"},
+                "agent": {"oneshot_return_timeout_seconds": 45},
+            },
+        ),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -856,6 +900,8 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     assert captured["session_db"] is sentinel_db
     assert captured["enabled_toolsets"] == ["session_search"]
     assert captured["prompt"] == "recall this"
+    assert captured["agent"]._oneshot_return_timeout_seconds == 45
+    assert captured["agent"]._oneshot_return_deadline is None
 
 
 def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):

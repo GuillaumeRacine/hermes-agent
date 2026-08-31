@@ -1623,6 +1623,57 @@ class TestRunJobSessionPersistence:
         assert raw_provider_error not in output
         assert "(FAILED)" in output
 
+    def test_run_job_rejects_max_iteration_summary_for_strict_job(self, tmp_path):
+        """Opt-in strict jobs cannot turn an incomplete fallback into success.
+
+        Normal cron reports keep their existing fallback-summary behavior. Jobs
+        whose durable artifact contract requires a terminal agent state can set
+        ``require_completed`` and must remain failed when the model uses every
+        iteration without completing.
+        """
+        job = {
+            "id": "strict-summary-job",
+            "name": "strict summary",
+            "prompt": "finish the durable artifact",
+            "require_completed": True,
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "incomplete but useful summary",
+                "completed": False,
+                "failed": False,
+                "turn_exit_reason": "max_iterations_reached(12/12)",
+            }
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert error == (
+            "RuntimeError: agent reached the iteration limit before completing "
+            "this strict cron job"
+        )
+        assert "(FAILED)" in output
+        assert "incomplete but useful summary" not in output
+        mock_agent.close.assert_called_once()
+
     def test_tick_marks_empty_response_as_error(self, tmp_path):
         """When run_job returns success=True but final_response is empty,
         tick() should mark the job as error so last_status != 'ok'.

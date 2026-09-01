@@ -654,6 +654,21 @@ class BackgroundReviewAgent:
         }
 
 
+class StatusCallbackAgent:
+    def __init__(self, **kwargs):
+        self.status_callback = kwargs.get("status_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.status_callback:
+            self.status_callback("lifecycle", "Compacting conversation context...")
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class VerboseAgent:
     """Agent that emits a tool call with args whose JSON exceeds 200 chars."""
     LONG_CODE = "x" * 300
@@ -1028,6 +1043,84 @@ async def test_run_agent_defers_background_review_notification_until_release(mon
     )
 
     assert result["final_response"] == "done"
+    assert adapter.sent == []
+    assert adapter._post_delivery_callbacks
+    callback_key = next(iter(adapter._post_delivery_callbacks))
+    callback = adapter.pop_post_delivery_callback(callback_key)
+    assert callable(callback)
+    callback()
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if adapter.sent:
+            break
+    assert [call["content"] for call in adapter.sent] == [
+        "💾 Skill 'prospect-scanner' created."
+    ]
+
+
+@pytest.mark.asyncio
+async def test_final_only_suppresses_status_callback_messages(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StatusCallbackAgent,
+        session_id="sess-final-only-status",
+        config_data={"display": {"platforms": {"slack": {"final_only": True}}}},
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="1700000000.000001",
+    )
+
+    assert result["final_response"] == "done"
+    await asyncio.sleep(0)
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_non_final_only_status_callback_is_unchanged(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StatusCallbackAgent,
+        session_id="sess-normal-status",
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="1700000000.000001",
+    )
+
+    assert result["final_response"] == "done"
+    await asyncio.sleep(0)
+    assert [call["content"] for call in adapter.sent] == [
+        "Compacting conversation context..."
+    ]
+
+
+@pytest.mark.asyncio
+async def test_final_only_discards_post_delivery_background_review(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        BackgroundReviewAgent,
+        session_id="sess-final-only-bg-review",
+        config_data={"display": {"platforms": {"slack": {"final_only": True}}}},
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="1700000000.000001",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter._post_delivery_callbacks
+    callback_key = next(iter(adapter._post_delivery_callbacks))
+    callback = adapter.pop_post_delivery_callback(callback_key)
+    assert callable(callback)
+    callback()
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if adapter.sent:
+            break
     assert adapter.sent == []
 
 

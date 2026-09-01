@@ -190,3 +190,29 @@ def test_telegram_final_response_keeps_normal_answers():
     answer = "Here is the clean summary you asked for."
 
     assert _sanitize_gateway_final_response(Platform.TELEGRAM, answer) == answer
+
+
+def test_final_only_strips_standalone_gate_and_trace_lines_from_final():
+    response = (
+        "Implemented and verified.\n\n"
+        "gate: gpt-5.4 — tightened the failure wording\n"
+        "trace: /Users/gui/.hermes/traces/agent-20260831.jsonl"
+    )
+
+    assert _sanitize_gateway_final_response(
+        Platform.SLACK, response, final_only=True
+    ) == "Implemented and verified."
+
+
+def test_non_final_only_keeps_gate_and_trace_lines():
+    response = "Implemented and verified.\ntrace: /tmp/trace.jsonl"
+
+    assert _sanitize_gateway_final_response(Platform.SLACK, response) == response
+
+
+def test_local_surface_is_unchanged_even_if_final_only_is_requested():
+    response = "Failure: run `hermes gateway restart`.\ntrace: /tmp/trace.jsonl"
+
+    assert _sanitize_gateway_final_response(
+        Platform.LOCAL, response, final_only=True
+    ) == response

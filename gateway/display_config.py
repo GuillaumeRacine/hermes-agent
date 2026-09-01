@@ -154,7 +154,25 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
 }
 
 # Canonical set of per-platform overrideable keys (for validation).
-OVERRIDEABLE_KEYS = frozenset(_GLOBAL_DEFAULTS.keys())
+OVERRIDEABLE_KEYS = frozenset((*_GLOBAL_DEFAULTS.keys(), "final_only"))
+
+
+def resolve_final_only(user_config: dict, platform_key: str) -> bool:
+    """Resolve the explicit per-platform final-only messaging policy.
+
+    Unlike ordinary display settings, this policy never inherits from a
+    global value. It must be opted into for one messaging platform and is
+    intentionally unavailable to CLI/TUI surfaces.
+    """
+    key = str(platform_key or "").lower()
+    if key in {"local", "cli", "tui"}:
+        return False
+    display_cfg = user_config.get("display") if isinstance(user_config, dict) else None
+    platforms = display_cfg.get("platforms") if isinstance(display_cfg, dict) else None
+    platform_cfg = platforms.get(key) if isinstance(platforms, dict) else None
+    if not isinstance(platform_cfg, dict) or "final_only" not in platform_cfg:
+        return False
+    return bool(_normalise("final_only", platform_cfg.get("final_only")))
 
 
 def resolve_display_setting(
@@ -240,6 +258,7 @@ def _normalise(setting: str, value: Any) -> Any:
         "interim_assistant_messages",
         "long_running_notifications",
         "busy_ack_detail",
+        "final_only",
     }:
         if isinstance(value, str):
             return value.lower() in {"true", "1", "yes", "on"}

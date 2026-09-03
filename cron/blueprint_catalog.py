@@ -476,6 +476,51 @@ CATALOG: List[AutomationBlueprint] = [
         ],
         tags=("daily", "curiosity"),
     ),
+    AutomationBlueprint(
+        key="daily-message-challenger",
+        title="Daily message challenger",
+        description="A scheduled external critic. Once a day it reviews all "
+        "recent threads and tasks and posts ONE tight challenge digest — "
+        "flagging stale rulings, over-analysis, duplicates, unread attachments, "
+        "and image-fetch failures. It challenges; it does not cheerlead.",
+        category="general",
+        schedule_template="{minute} {hour} * * *",
+        # The export preprocessor is wired via the job's --script (see the
+        # daily-message-challenger SKILL.md for the exact `hermes cron create`
+        # command); its JSON lands in the prompt under "## Script Output".
+        prompt_template=(
+            "You are an EXTERNAL CHALLENGER reviewing today's activity export "
+            "(the ## Script Output above: a JSON envelope with an `items` list, "
+            "each carrying challenge `flags`). You are a critic, not a "
+            "cheerleader. Score each open item on this rubric, 0-5 each:\n"
+            "  - Decisiveness: is there a ruling, or just more analysis?\n"
+            "  - Content-extraction: was the attached/linked content actually "
+            "read and acted on?\n"
+            "  - Ledger integrity: do the claimed states match the live status?\n"
+            "  - Signal-to-noise: is there fluff or repetition to cut?\n"
+            "  - Image reliability: any attachment the bot never fetched?\n"
+            "  - Proactivity: is anything just sitting, waiting to be pushed?\n"
+            "Enforce a WIP posture: ANY item past {packet_bar} analysis packets "
+            "with no terminal disposition (flag `over_analyzed`) is the failure "
+            "mode — call it out explicitly. Also surface `stale`, "
+            "`duplicate_cluster`, `unread_attachment`, and `image_fetch_failure` "
+            "items. Post ONE tight digest to the channel: prefer a compact table "
+            "(item | worst flag | one-line challenge), no preamble, no fluff. "
+            "If the export is empty or nothing genuinely warrants a challenge, "
+            "respond with exactly [SILENT]."
+        ),
+        slots=[
+            _TIME("06:00"),
+            BlueprintSlot(
+                name="packet_bar", type="enum", label="Analysis-packet WIP bar",
+                default="2", options=("1", "2", "3"),
+                help="Items past this many analysis turns with no disposition "
+                "are flagged as over-analyzed (the failure mode).",
+            ),
+            _DELIVER,
+        ],
+        tags=("daily", "review", "challenger", "critic"),
+    ),
 ]
 
 _CATALOG_BY_KEY = {r.key: r for r in CATALOG}

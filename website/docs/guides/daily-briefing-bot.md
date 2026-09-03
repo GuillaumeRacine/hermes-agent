@@ -204,6 +204,39 @@ Search for the latest news on these topics. Summarize the top 3 stories with lin
 Including details about who the briefing is *for* dramatically improves relevance. Tell the agent your role, interests, and what to skip.
 :::
 
+### Make It Scannable
+
+A briefing you can skim in five seconds beats a complete one you have to decode. If the output reads like machine log lines — internal IDs first, status codes, pipe-delimited fields — the format is fighting the reader. Bake formatting rules into the prompt so the agent leads with meaning and keeps the machinery out of the way.
+
+Compare the same item before and after a formatting pass:
+
+```text
+Before:  ema_55a890a2ec [do] r2 ~20m — personal | <a@example.com> | Rappel #2 - unpaid invoice
+After:   Unpaid invoice — reminder #2 · a@example.com · 20m · `ema_55a890a2ec`
+```
+
+The content leads, the duration is a human unit, and the internal ID moves to the end — kept, in backticks, so it is still referenceable — instead of shouting from the front of every line.
+
+Add a formatting contract to any briefing prompt:
+
+```
+/cron add "0 8 * * *" "<your briefing instructions>
+
+FORMAT FOR FAST SCANNING:
+- Lead each line with the human-readable content, never an internal ID or status code.
+- Keep any ID last, in backticks, so it stays referenceable without dominating the line.
+- Bold the section headers; leave one blank line between sections.
+- Human units only: 90m, ~1h30, 8h — never raw counts like 480m. Money as \$1,234.56.
+- One line per item: Subject · who · how-long · id. No pipe-delimited field soup, no codes (r2, [do]) in the visible text.
+- Collapse duplicate threads into a single line; flag likely duplicates instead of listing each one.
+- Group multi-day sections by day, with the day bolded.
+- End with a one-line legend for any reactions or commands the reader can use."
+```
+
+:::tip Show, don't tell
+Give the agent one before/after example of a formatted line directly in the prompt. A single concrete sample locks in the format far more reliably than a list of rules alone.
+:::
+
 ## Step 4: Manage Your Jobs
 
 ### List All Scheduled Jobs

@@ -195,3 +195,55 @@ def test_corrupt_state_is_preserved_on_write(tmp_path: Path):
 
     assert path.read_text(encoding="utf-8") == "{broken"
     assert circuit_status("provider", "model", path=path)["status"] == "unavailable"
+
+
+# ── reset_seconds_from_context (quota reset → cooldown) ──────────────────────
+
+from hermes_cli.provider_circuits import reset_seconds_from_context  # noqa: E402
+
+
+def test_reset_seconds_epoch_number():
+    now = 1_788_400_000.0
+    assert reset_seconds_from_context({"reset_at": now + 90_000}, now=now) == 90_000
+
+
+def test_reset_seconds_epoch_string_and_millis():
+    now = 1_788_400_000.0
+    assert reset_seconds_from_context({"reset_at": str(int(now + 3_600))}, now=now) == 3_600
+    assert reset_seconds_from_context({"reset_at": (now + 7_200) * 1000}, now=now) == 7_200
+
+
+def test_reset_seconds_iso_timestamp():
+    now = 1_788_400_000.0
+    from datetime import datetime, timezone
+    iso = datetime.fromtimestamp(now + 5_000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    assert reset_seconds_from_context({"reset_at": iso}, now=now) == 5_000
+
+
+def test_reset_seconds_relative_small_number_and_minimum():
+    now = 1_788_400_000.0
+    # A small value is "seconds until reset" — clamp to the minimum probe interval.
+    assert reset_seconds_from_context({"reset_at": 5}, now=now) == 60.0
+    assert reset_seconds_from_context({"reset_at": 500}, now=now) == 500.0
+
+
+def test_reset_seconds_past_missing_or_garbage_is_none():
+    now = 1_788_400_000.0
+    assert reset_seconds_from_context({"reset_at": now - 10}, now=now) is None
+    assert reset_seconds_from_context({}, now=now) is None
+    assert reset_seconds_from_context(None, now=now) is None
+    assert reset_seconds_from_context({"reset_at": "next tuesday"}, now=now) is None
+    assert reset_seconds_from_context({"reset_at": True}, now=now) is None
+
+
+def test_record_failure_honours_reset_from_error_context(tmp_path: Path):
+    """A 429 whose body carries resets_at keeps the circuit open until then."""
+    path = tmp_path / "circuits.json"
+    now = 1_788_400_000.0
+    seconds = reset_seconds_from_context({"reset_at": now + 350_000}, now=now)
+    record_failure("openai-codex", "gpt-5.5", FailoverReason.rate_limit,
+                   retry_after_seconds=seconds, path=path, now=now)
+    status = circuit_status("openai-codex", "gpt-5.5", path=path, now=now + 3_601)
+    assert status["status"] == "open", "flat 1h cooldown must not reopen an exhausted quota"
+    status = circuit_status("openai-codex", "gpt-5.5", path=path, now=now + 350_001)
+    assert status["status"] != "open"

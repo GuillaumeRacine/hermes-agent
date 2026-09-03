@@ -1090,7 +1090,11 @@ def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
     agent._cached_system_prompt = sp
 
 
-def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
+def try_activate_fallback(
+    agent,
+    reason: "FailoverReason | None" = None,
+    error: Exception | None = None,
+) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
     Called when the current model is failing after retries.  Swaps the
@@ -1101,9 +1105,16 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     Uses the centralized provider router (resolve_provider_client) for
     auth resolution and client construction — no duplicated provider→key
     mappings.
+
+    ``error`` is the provider exception that triggered the switch, when the
+    caller has it. Its body/headers may carry the real reset time (Codex
+    ``resets_at``, ``Retry-After``); that drives the circuit cooldown so an
+    exhausted plan quota keeps the provider closed until it actually resets
+    instead of the flat one-hour default.
     """
+    reset_seconds = None
     if reason is not None:
-        record_provider_failure(agent, reason)
+        reset_seconds = record_provider_failure(agent, reason, error=error)
 
     if reason in {FailoverReason.rate_limit, FailoverReason.billing}:
         # Only start cooldown when leaving the primary provider.  If we're
@@ -1113,7 +1124,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         current_provider = (getattr(agent, "provider", "") or "").strip().lower()
         primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
         if (not fallback_already_active) or (primary_provider and current_provider == primary_provider):
-            agent._rate_limited_until = time.monotonic() + 60
+            # Known reset → stay off the primary until then (in-process);
+            # unknown → the historical 60s probe interval.
+            agent._rate_limited_until = time.monotonic() + (
+                reset_seconds if reset_seconds and reset_seconds > 60 else 60
+            )
     if agent._fallback_index >= len(agent._fallback_chain):
         return False
 
@@ -1425,8 +1440,39 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         return agent._try_activate_fallback()  # try next in chain
 
 
-def record_provider_failure(agent, reason: "FailoverReason") -> None:
-    """Persist one provider failure without forcing a fallback transition."""
+def reset_seconds_from_error(error: Exception | None) -> float | None:
+    """Best-effort: seconds until the provider says its quota/rate limit resets.
+
+    Reads the structured error context (``resets_at`` / ``retry_after`` in the
+    body, ``Retry-After`` / ``x-ratelimit-reset`` headers) that
+    ``extract_api_error_context`` already knows how to parse, and converts it
+    to a cooldown length. ``None`` when the error carries no usable reset.
+    """
+    if error is None:
+        return None
+    try:
+        from agent.agent_runtime_helpers import extract_api_error_context
+        from hermes_cli.provider_circuits import reset_seconds_from_context
+
+        return reset_seconds_from_context(extract_api_error_context(error))
+    except Exception:
+        logger.debug("Could not derive reset time from provider error", exc_info=True)
+        return None
+
+
+def record_provider_failure(
+    agent,
+    reason: "FailoverReason",
+    error: Exception | None = None,
+) -> float | None:
+    """Persist one provider failure without forcing a fallback transition.
+
+    When ``error`` carries a reset time (plan quota ``resets_at``,
+    ``Retry-After``), the circuit is opened until that reset instead of the
+    flat per-reason cooldown. Returns the reset length in seconds when one
+    was found, else ``None``.
+    """
+    reset_seconds = reset_seconds_from_error(error)
     try:
         from hermes_cli.config import load_config
         from hermes_cli.provider_circuits import record_failure
@@ -1439,10 +1485,19 @@ def record_provider_failure(agent, reason: "FailoverReason") -> None:
                 getattr(agent, "model", ""),
                 reason,
                 agent=agent,
+                retry_after_seconds=reset_seconds,
                 config=_circuit_config,
             )
+            if reset_seconds:
+                logger.info(
+                    "Provider circuit for %s/%s opened for %.0fs from the provider's reset time",
+                    getattr(agent, "provider", ""),
+                    getattr(agent, "model", ""),
+                    reset_seconds,
+                )
     except Exception:
         logger.debug("Provider circuit failure recording skipped", exc_info=True)
+    return reset_seconds
 
 
 def record_provider_success(agent) -> None:

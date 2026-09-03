@@ -2148,6 +2148,151 @@ def _scan_assembled_cron_prompt(
     return assembled
 
 
+# ---------------------------------------------------------------------------
+# Inference preflight: drift + provider-circuit checks that must run BEFORE
+# a job's pre-run script (hermes-home #241) and before any paid call.
+# ---------------------------------------------------------------------------
+
+def _load_cron_config() -> dict:
+    """Load config.yaml the way run_job() does (managed overlay + env expansion), fail-open to {}."""
+    try:
+        import yaml
+        from hermes_cli.config import get_config_path
+
+        _cfg_path = get_config_path()
+        if not _cfg_path.exists():
+            return {}
+        with open(_cfg_path, encoding="utf-8") as _f:
+            cfg = yaml.safe_load(_f) or {}
+        try:
+            from hermes_cli import managed_scope
+            cfg = managed_scope.apply_managed_overlay(cfg)
+        except Exception:
+            pass
+        return _expand_env_vars(cfg)
+    except Exception as exc:
+        logger.debug("Cron preflight: config load failed (%s); skipping preflight", exc)
+        return {}
+
+
+def _open_circuit_note(provider: Optional[str], model: Optional[str], cfg: Optional[dict]) -> Optional[str]:
+    """Return "reason until <ts>" when the circuit for provider/model (or provider-wide) is open."""
+    try:
+        block = (cfg or {}).get("provider_circuits") or {}
+        if not block.get("enabled", True):
+            return None
+        from hermes_cli.provider_circuits import circuit_status, state_path
+
+        prov = str(provider or "").strip().lower()
+        if not prov or prov in {"auto", "moa"}:
+            return None
+        path = state_path(cfg or {})
+        for key_model in (str(model or "").strip() or "*", "*"):
+            status = circuit_status(prov, key_model, path=path)
+            if status.get("status") == "open":
+                return f"{status.get('reason') or 'failure'} until {status.get('open_until') or 'unknown'}"
+    except Exception:
+        logger.debug("Cron preflight: circuit check failed open", exc_info=True)
+    return None
+
+
+def _fallback_entries(cfg: Optional[dict]) -> list:
+    fb = (cfg or {}).get("fallback_providers") or (cfg or {}).get("fallback_model")
+    fb_list = (fb if isinstance(fb, list) else [fb]) if fb else []
+    return [e for e in fb_list if isinstance(e, dict) and e.get("provider")]
+
+
+def _first_closed_fallback_runtime(cfg: dict, resolve_runtime_provider, *, skip_provider: Optional[str] = None):
+    """Resolve the first fallback entry whose circuit is closed. Returns (runtime, model) or (None, None)."""
+    skip = str(skip_provider or "").strip().lower()
+    for entry in _fallback_entries(cfg):
+        prov = str(entry.get("provider") or "").strip().lower()
+        if prov == skip:
+            continue
+        if _open_circuit_note(prov, entry.get("model"), cfg):
+            continue
+        try:
+            kwargs = {"requested": entry.get("provider")}
+            if entry.get("base_url"):
+                kwargs["explicit_base_url"] = entry["base_url"]
+            if entry.get("api_key"):
+                kwargs["explicit_api_key"] = entry["api_key"]
+            runtime = resolve_runtime_provider(**kwargs)
+            return runtime, (str(entry.get("model") or "").strip() or None)
+        except Exception as exc:
+            logger.debug("Cron preflight: fallback %s failed to resolve: %s", prov, exc)
+    return None, None
+
+
+def _inference_preflight_error(job: dict) -> Optional[str]:
+    """Return an error string when this agent job cannot / must not make an inference call.
+
+    Two checks, both cheap and side-effect free:
+      1. Unpinned-config drift (same rule as the fail-closed guard later in
+         run_job) — so a pre-run script never runs for a job the guard will
+         refuse anyway.
+      2. Provider circuits — if the primary's circuit is open AND every
+         fallback entry's circuit is open too, nothing can serve the job.
+    Fail-open: any exception here returns None and the normal path decides.
+    """
+    if job.get("no_agent"):
+        return None
+    try:
+        cfg = _load_cron_config()
+        if not cfg:
+            return None
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        try:
+            runtime = resolve_runtime_provider(requested=job.get("provider"))
+        except Exception:
+            return None  # auth/resolution problems are handled (with fallbacks) by run_job
+        provider = str(runtime.get("provider") or "").strip().lower()
+        model = str(job.get("model") or "").strip()
+        if not model:
+            _model_cfg = cfg.get("model") or {}
+            if isinstance(_model_cfg, str):
+                model = _model_cfg
+            elif isinstance(_model_cfg, dict):
+                model = str(_model_cfg.get("default") or _model_cfg.get("model") or "")
+        model = model.strip()
+
+        drift = []
+        snap_p = (job.get("provider_snapshot") or "").strip().lower()
+        if snap_p and not (job.get("provider") or "").strip() and provider and provider != snap_p:
+            drift.append(f"provider '{snap_p}' -> '{provider}'")
+        snap_m = (job.get("model_snapshot") or "").strip().lower()
+        if snap_m and not (job.get("model") or "").strip() and model and model.lower() != snap_m:
+            drift.append(f"model '{snap_m}' -> '{model}'")
+        if drift:
+            changes = "; ".join(drift)
+            return (
+                f"Skipped to prevent unintended spend: global inference config "
+                f"drifted since this job was created ({changes}), and this job "
+                f"is unpinned. No inference call was made and the pre-run script "
+                f"did not run. Pin it explicitly: `cronjob action=update "
+                f"job_id={job.get('id')} provider=<provider> model=<model>` "
+                f"(or pin the original values to keep them). See #44585."
+            )
+
+        note = _open_circuit_note(provider, model, cfg)
+        if note:
+            for entry in _fallback_entries(cfg):
+                prov = str(entry.get("provider") or "").strip().lower()
+                if prov == provider:
+                    continue
+                if not _open_circuit_note(prov, entry.get("model"), cfg):
+                    return None  # a fallback can serve it; run_job routes there
+            return (
+                f"Skipped: provider circuit open for {provider}/{model} ({note}) and every "
+                f"fallback provider's circuit is open too. No inference call was made and "
+                f"the pre-run script did not run."
+            )
+    except Exception:
+        logger.debug("Cron preflight failed open", exc_info=True)
+    return None
+
+
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -2284,6 +2429,24 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # the script is only executed once.
     prerun_script = None
     script_path = job.get("script")
+    # Inference preflight BEFORE any side-effecting pre-run script: if the
+    # agent step is going to be refused (unpinned config drift) or cannot be
+    # served (every candidate provider's circuit is open), fail here so the
+    # script never consumes its inputs (cursor/state files) for a run that
+    # will not deliver. See hermes-home #241 for the incident this prevents.
+    _preflight_error = _inference_preflight_error(job)
+    if _preflight_error:
+        logger.warning("Job '%s' (ID: %s): preflight refused run — %s", job_name, job_id, _preflight_error)
+        _error_msg = f"RuntimeError: {_preflight_error}"
+        _failed_doc = (
+            f"# Cron Job: {job_name} (FAILED)\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"**Schedule:** {job.get('schedule_display', 'N/A')}\n\n"
+            "## Error\n\n"
+            f"```\n{_error_msg}\n```\n"
+        )
+        return False, _failed_doc, "", _error_msg
     if script_path:
         prerun_script = _run_job_script(script_path)
         _ran_ok, _script_output = prerun_script
@@ -2563,6 +2726,32 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         except Exception as exc:
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
+
+        # Provider-circuit routing: if the resolved primary is known to be
+        # out of quota / rate-limited (circuit open, e.g. Codex
+        # usage_limit_reached with a multi-day reset), do not pay a doomed
+        # 429 round-trip — start the job on the first fallback entry whose
+        # circuit is closed. The in-agent fallback chain still applies after
+        # that for anything that fails mid-run.
+        _circuit_note = _open_circuit_note(runtime.get("provider"), model, _cfg)
+        if _circuit_note:
+            _fb_runtime, _fb_model = _first_closed_fallback_runtime(
+                _cfg, resolve_runtime_provider, skip_provider=runtime.get("provider")
+            )
+            if _fb_runtime is None:
+                raise RuntimeError(
+                    f"Skipped: provider circuit open for {runtime.get('provider')}/{model} "
+                    f"({_circuit_note}) and no fallback provider has a closed circuit. "
+                    "No inference call was made."
+                )
+            logger.warning(
+                "Job '%s': circuit open for %s/%s (%s); running on fallback %s/%s",
+                job_id, runtime.get("provider"), model, _circuit_note,
+                _fb_runtime.get("provider"), _fb_model,
+            )
+            runtime = _fb_runtime
+            if _fb_model:
+                model = _fb_model
 
         # Provider/model-drift fail-closed guard (#44585).
         #

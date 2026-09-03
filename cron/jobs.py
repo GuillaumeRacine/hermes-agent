@@ -7,6 +7,7 @@ Output is saved to ~/.hermes/cron/output/{job_id}/{timestamp}.md
 
 import contextlib
 import copy
+import hashlib
 import json
 import logging
 import shutil
@@ -871,6 +872,34 @@ def _normalized_inference_axes(job: Dict[str, Any]) -> Tuple[Optional[str], Opti
     )
 
 
+def content_delivery_hash(text: str) -> str:
+    """Stable content hash used to detect unchanged cron deliveries.
+
+    Pure/side-effect-free so it's trivial to unit test. SHA-256 over the
+    UTF-8 bytes of ``text`` — identical text always yields the same digest,
+    any change yields a different one.
+    """
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def should_suppress_unchanged_delivery(job: Dict[str, Any], content: str) -> bool:
+    """Decide whether a cron delivery should be skipped as an unchanged repost.
+
+    Returns True ONLY when all of the following hold:
+      - the job opted in via ``suppress_unchanged`` (truthy),
+      - ``content`` is non-empty, and
+      - its content hash equals the job's stored ``last_delivered_hash``.
+
+    Pure/side-effect-free. Uses ``.get(...)`` so pre-existing jobs whose
+    records predate these fields (no keys in jobs.json) simply return False.
+    """
+    if not job.get("suppress_unchanged"):
+        return False
+    if not content:
+        return False
+    return content_delivery_hash(content) == job.get("last_delivered_hash")
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -890,6 +919,7 @@ def create_job(
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
     max_iterations: Optional[int] = None,
+    suppress_unchanged: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -937,6 +967,10 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        suppress_unchanged: When True, the scheduler skips delivering output whose
+                body is byte-identical to this job's last successfully-delivered
+                body ("post only on state change"). Default False → no behaviour
+                change for existing jobs.
 
     Returns:
         The created job dict
@@ -969,6 +1003,7 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_max_iterations = _normalize_max_iterations(max_iterations)
     normalized_no_agent = bool(no_agent)
+    normalized_suppress_unchanged = bool(suppress_unchanged)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
 
     # no_agent jobs are meaningless without a script — the script IS the job.
@@ -1015,6 +1050,11 @@ def create_job(
         "script": normalized_script,
         "no_agent": normalized_no_agent,
         "context_from": context_from,
+        # Content-dedup delivery (opt-in). When suppress_unchanged is True the
+        # scheduler skips delivering output byte-identical to the last
+        # successfully-delivered body. Default False = no behaviour change.
+        "suppress_unchanged": normalized_suppress_unchanged,
+        "last_delivered_hash": None,
         "schedule": parsed_schedule,
         "schedule_display": parsed_schedule.get("display", schedule),
         "repeat": {
@@ -1138,6 +1178,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["max_iterations"]
                 )
 
+            # Toggling suppress_unchanged: normalize to a strict bool. Leave
+            # last_delivered_hash untouched — the next delivery reconciles it.
+            if "suppress_unchanged" in updates:
+                updates["suppress_unchanged"] = bool(updates["suppress_unchanged"])
+
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
             schedule_changed = "schedule" in updates
@@ -1260,12 +1305,18 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None,
+                 delivered_hash: Optional[str] = None):
     """
     Mark a job as having been run.
-    
+
     Updates last_run_at, last_status, increments completed count,
     computes next_run_at, and auto-deletes if repeat limit reached.
+
+    ``delivered_hash`` (opt-in ``suppress_unchanged`` jobs only) records the
+    content hash of the body that was just delivered so the next tick can
+    detect an unchanged repost. When None (the default), the stored
+    ``last_delivered_hash`` is left untouched.
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
@@ -1280,6 +1331,11 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                # Record the delivered-content hash for suppress_unchanged jobs.
+                # None = leave the stored hash unchanged (e.g. a suppressed tick
+                # or a job that never opted in).
+                if delivered_hash is not None:
+                    job["last_delivered_hash"] = delivered_hash
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None

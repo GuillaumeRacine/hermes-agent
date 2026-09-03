@@ -259,7 +259,14 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import (
+    get_due_jobs,
+    mark_job_run,
+    save_job_output,
+    advance_next_run,
+    content_delivery_hash,
+    should_suppress_unchanged_delivery,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -2822,13 +2829,31 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
             should_deliver = False
 
+        # Opt-in content dedup: for suppress_unchanged jobs, skip delivering a
+        # body byte-identical to the last one we successfully delivered ("post
+        # only on state change"). Default-off jobs are never affected.
+        if should_deliver and should_suppress_unchanged_delivery(job, deliver_content):
+            name = job.get("name") or job["id"]
+            logger.info(
+                "[cron] suppress_unchanged: skipping identical delivery for job '%s'",
+                name,
+            )
+            should_deliver = False
+
         delivery_error = None
+        delivered_hash = None
         if should_deliver:
             try:
                 delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
             except Exception as de:
                 delivery_error = str(de)
                 logger.error("Delivery failed for job %s: %s", job["id"], de)
+            # Record the delivered hash ONLY for jobs that opted in AND when
+            # delivery actually succeeded — never for default-off jobs (avoids
+            # churn) and never on delivery failure (so a transient failure
+            # doesn't wrongly suppress the next, unchanged retry).
+            if job.get("suppress_unchanged") and delivery_error is None:
+                delivered_hash = content_delivery_hash(deliver_content)
 
         # Treat empty final_response as a soft failure so last_status
         # is not "ok" — the agent ran but produced nothing useful.
@@ -2837,7 +2862,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-        mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        mark_job_run(
+            job["id"], success, error,
+            delivery_error=delivery_error, delivered_hash=delivered_hash,
+        )
         return True
 
     except Exception as e:

@@ -3334,6 +3334,69 @@ def _candidate_context_window(
     return None
 
 
+def _circuit_open_note(provider: str, model: Optional[str]) -> Optional[str]:
+    """Return "reason until <ts>" when the persistent provider circuit is open.
+
+    Auxiliary calls (vision, MoA references/aggregator, compression, titles)
+    used to walk their fallback chains blind to the circuit state the main
+    agent maintains in ``state/provider-circuits.json``, so a provider whose
+    plan quota was exhausted for days got re-dialled by every auxiliary task.
+    Fail-open: any problem reading circuit state returns None.
+    """
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.provider_circuits import circuit_status, state_path
+
+        cfg = load_config()
+        if not (cfg.get("provider_circuits") or {}).get("enabled", True):
+            return None
+        prov = str(provider or "").strip().lower()
+        if not prov or prov in {"auto", "moa"}:
+            return None
+        status = circuit_status(prov, str(model or "").strip() or "*", path=state_path(cfg))
+        if status.get("status") == "open":
+            return f"{status.get('reason') or 'failure'} until {status.get('open_until') or 'unknown'}"
+    except Exception:
+        logger.debug("Auxiliary circuit check failed open for %s", provider, exc_info=True)
+    return None
+
+
+def _record_circuit_failure(provider: str, model: Optional[str], exc: Exception) -> None:
+    """Persist a quota/rate-limit failure from an auxiliary call into the provider circuit.
+
+    Uses the provider's own reset time (Codex ``resets_at``, ``Retry-After``)
+    for the cooldown when the error carries one, so the circuit stays open
+    until the quota really resets. Only billing and rate-limit failures are
+    recorded; transient errors are left to the main agent's threshold logic.
+    """
+    try:
+        if _is_payment_error(exc):
+            reason = "billing"
+        elif _is_rate_limit_error(exc):
+            reason = "rate_limit"
+        else:
+            return
+        prov = str(provider or "").strip().lower()
+        if not prov or prov in {"auto", "moa"}:
+            return
+        from agent.chat_completion_helpers import reset_seconds_from_error
+        from hermes_cli.config import load_config
+        from hermes_cli.provider_circuits import record_failure
+
+        cfg = load_config()
+        if not (cfg.get("provider_circuits") or {}).get("enabled", True):
+            return
+        record_failure(
+            prov,
+            str(model or "").strip() or "*",
+            reason,
+            retry_after_seconds=reset_seconds_from_error(exc),
+            config=cfg,
+        )
+    except Exception:
+        logger.debug("Auxiliary circuit failure recording skipped for %s", provider, exc_info=True)
+
+
 def _try_configured_fallback_chain(
     task: str,
     failed_provider: str,
@@ -3369,6 +3432,13 @@ def _try_configured_fallback_chain(
         fb_model = str(entry.get("model", "")).strip() or None
 
         label = f"fallback_chain[{i}]({fb_provider})"
+
+        _open = _circuit_open_note(fb_provider, fb_model)
+        if _open:
+            logger.info("Auxiliary %s: skipping %s — provider circuit open (%s)",
+                        task, label, _open)
+            tried.append(f"{label} (circuit open)")
+            continue
 
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
@@ -3502,6 +3572,12 @@ def _try_main_fallback_chain(
         if _is_provider_unhealthy(fb_norm):
             _log_skip_unhealthy(fb_norm, task)
             tried.append(f"{label} (unhealthy)")
+            continue
+        _open = _circuit_open_note(fb_norm, fb_model)
+        if _open:
+            logger.info("Auxiliary %s: skipping %s — provider circuit open (%s)",
+                        task or "call", label, _open)
+            tried.append(f"{label} (circuit open)")
             continue
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
@@ -6002,8 +6078,21 @@ def call_llm(
                 _mark_provider_unhealthy(
                     _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime) or resolved_provider
                 )
+                _record_circuit_failure(
+                    _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime) or resolved_provider,
+                    final_model,
+                    first_err,
+                )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
+                # Persist into the provider circuit (with the provider's own
+                # reset time when the 429 body carries one) so the main agent,
+                # cron jobs, and the other auxiliary tasks stop re-dialling it.
+                _record_circuit_failure(
+                    _recoverable_pool_provider(resolved_provider, client) or resolved_provider,
+                    final_model,
+                    first_err,
+                )
             elif _is_model_incompatible_error(first_err):
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
@@ -6470,8 +6559,21 @@ async def async_call_llm(
                 _mark_provider_unhealthy(
                     _recoverable_pool_provider(resolved_provider, client) or resolved_provider
                 )
+                _record_circuit_failure(
+                    _recoverable_pool_provider(resolved_provider, client) or resolved_provider,
+                    final_model,
+                    first_err,
+                )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
+                # Persist into the provider circuit (with the provider's own
+                # reset time when the 429 body carries one) so the main agent,
+                # cron jobs, and the other auxiliary tasks stop re-dialling it.
+                _record_circuit_failure(
+                    _recoverable_pool_provider(resolved_provider, client) or resolved_provider,
+                    final_model,
+                    first_err,
+                )
             elif _is_model_incompatible_error(first_err):
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):

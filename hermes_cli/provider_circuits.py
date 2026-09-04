@@ -177,6 +177,57 @@ def _retry_hint_seconds(agent: Any) -> float | None:
     return max(depleted) if depleted else None
 
 
+def reset_seconds_from_context(
+    context: dict[str, Any] | None,
+    *,
+    now: float | None = None,
+    minimum: float = 60.0,
+) -> float | None:
+    """Turn a parsed API-error context into a cooldown length in seconds.
+
+    ``context["reset_at"]`` is whatever ``extract_api_error_context`` found:
+    an epoch number (Codex ``resets_at``), a numeric string, an ISO-8601
+    timestamp, or a raw ``x-ratelimit-reset`` header value (epoch seconds or
+    milliseconds). Returns ``None`` when nothing usable is present or the
+    reset is already in the past, so callers fall back to the flat cooldown.
+    ``minimum`` protects against a reset a few seconds away turning into a
+    zero-length circuit that closes before the retry even fires.
+    """
+    if not isinstance(context, dict):
+        return None
+    raw = context.get("reset_at")
+    if raw in (None, ""):
+        return None
+    current = time.time() if now is None else float(now)
+    target: float | None = None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        target = float(raw)
+    elif isinstance(raw, str):
+        text = raw.strip()
+        try:
+            target = float(text)
+        except ValueError:
+            try:
+                target = datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return None
+    else:
+        return None
+    if target is None:
+        return None
+    # Header values are sometimes epoch milliseconds.
+    if target > 1e12:
+        target = target / 1000.0
+    # A small number is a relative "seconds until reset", not an epoch.
+    if target < 1e9:
+        remaining = target
+    else:
+        remaining = target - current
+    if remaining <= 0:
+        return None
+    return max(float(minimum), remaining)
+
+
 def _entry_is_open(entry: dict[str, Any], now: float) -> bool:
     try:
         return float(entry.get("open_until_epoch") or 0) > now

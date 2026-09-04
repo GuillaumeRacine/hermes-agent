@@ -7,6 +7,7 @@ assemble pieces, then combines them with memory and ephemeral prompts.
 import json
 import logging
 import os
+import time
 import threading
 import contextvars
 from collections import OrderedDict
@@ -1737,6 +1738,49 @@ def _truncate_content(
         f"{target}]\n\n"
     )
     return head + marker + tail
+
+
+PROVIDER_QUOTA_NOTICE_FILE = "provider-quota.md"
+PROVIDER_QUOTA_NOTICE_MAX_AGE_SECONDS = 4 * 3600
+
+
+def load_provider_quota_notice(
+    max_age_seconds: int = PROVIDER_QUOTA_NOTICE_MAX_AGE_SECONDS,
+) -> Optional[str]:
+    """Return the current provider-quota notice for the system prompt, or None.
+
+    ``HERMES_HOME/state/provider-quota.md`` is written by the quota poller
+    (``scripts/provider_quota_poll.py`` in hermes-home) — a few lines such as
+    "openai-codex: weekly window 97% used, resets Sun 22:28 EDT". Injecting it
+    makes every agent (gateway, CLI, cron) aware of what it can spend, so it
+    can budget its own turns and tell the user *why* it is on a fallback
+    instead of silently degrading. Stale files (older than ``max_age_seconds``)
+    are ignored so a dead poller never pins an outdated number into prompts.
+    """
+    try:
+        path = get_hermes_home() / "state" / PROVIDER_QUOTA_NOTICE_FILE
+        if not path.exists():
+            return None
+        age = time.time() - path.stat().st_mtime
+        if max_age_seconds and age > max_age_seconds:
+            return None
+        text = path.read_text(encoding="utf-8").strip()
+        if not text:
+            return None
+        text = _scan_context_content(text, PROVIDER_QUOTA_NOTICE_FILE)
+        # Hard cap: this is a status line, not a document.
+        if len(text) > 1500:
+            text = text[:1500].rstrip() + "…"
+        return (
+            "# Provider quota (live)\n\n"
+            "Current inference-provider budget, refreshed by the quota poller. "
+            "Treat an exhausted or near-exhausted provider as unavailable until its "
+            "reset: keep turns short, avoid speculative tool loops, and say plainly "
+            "when you are running on a fallback and why.\n\n" + text
+        )
+    except Exception as e:
+        logger.debug("Could not load provider quota notice: %s", e)
+        return None
 
 
 def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:

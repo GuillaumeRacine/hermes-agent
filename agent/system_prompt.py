@@ -423,6 +423,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # ── Volatile tier (changes per session/turn — never cached) ───
     volatile_parts: List[str] = []
 
+    # Live provider-quota notice (state/provider-quota.md, written by the
+    # quota poller). Volatile because it changes hourly; absent when no
+    # poller runs or the file is stale.
+    _quota_loader = getattr(_r, "load_provider_quota_notice", None)
+    if callable(_quota_loader):
+        try:
+            _quota_notice = _quota_loader()
+        except Exception:
+            _quota_notice = None
+        if _quota_notice:
+            volatile_parts.append(_quota_notice)
+
     if agent._memory_store:
         if agent._memory_enabled:
             mem_block = agent._memory_store.format_for_system_prompt("memory")

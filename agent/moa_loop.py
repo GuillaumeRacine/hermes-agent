@@ -30,6 +30,67 @@ def _slot_label(slot: dict[str, str]) -> str:
     return f"{slot.get('provider', '').strip()}:{slot.get('model', '').strip()}"
 
 
+def _slot_circuit_open(slot: dict[str, str]) -> str | None:
+    """Return a human-readable "open until" note when the slot's provider circuit is open.
+
+    MoA slots bypass the main agent's fallback chain, so without this check a
+    reference whose provider is out of quota (Codex ``usage_limit_reached``
+    with a multi-day reset) is re-dialled on every turn, paying a 429
+    round-trip each time. Fail-open: any error reading circuit state means
+    "not open" so a broken state file can never silence a healthy reference.
+    """
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.provider_circuits import circuit_status, state_path
+
+        cfg = load_config()
+        if not (cfg.get("provider_circuits") or {}).get("enabled", True):
+            return None
+        provider = str(slot.get("provider") or "").strip().lower()
+        model = str(slot.get("model") or "").strip()
+        if not provider:
+            return None
+        status = circuit_status(provider, model or "*", path=state_path(cfg))
+        if status.get("status") == "open":
+            return f"{status.get('reason') or 'failure'} until {status.get('open_until') or 'unknown'}"
+    except Exception:
+        logger.debug("MoA circuit check failed open for %s", _slot_label(slot), exc_info=True)
+    return None
+
+
+def _record_slot_failure(slot: dict[str, str], exc: Exception) -> None:
+    """Open the provider circuit for a reference slot that hit a quota/rate limit.
+
+    Only rate-limit and billing failures are recorded (the immediate-open
+    reasons); transient errors are left to the main agent's threshold logic so
+    one flaky reference call cannot take a provider out of rotation.
+    """
+    try:
+        from agent.auxiliary_client import _is_payment_error, _is_rate_limit_error
+        from agent.chat_completion_helpers import reset_seconds_from_error
+        from hermes_cli.config import load_config
+        from hermes_cli.provider_circuits import record_failure
+
+        if _is_payment_error(exc):
+            reason = "billing"
+        elif _is_rate_limit_error(exc):
+            reason = "rate_limit"
+        else:
+            return
+        cfg = load_config()
+        if not (cfg.get("provider_circuits") or {}).get("enabled", True):
+            return
+        record_failure(
+            str(slot.get("provider") or "").strip().lower(),
+            str(slot.get("model") or "").strip() or "*",
+            reason,
+            retry_after_seconds=reset_seconds_from_error(exc),
+            config=cfg,
+        )
+    except Exception:
+        logger.debug("MoA circuit failure recording skipped for %s", _slot_label(slot), exc_info=True)
+
+
 def _slot_runtime(slot: dict[str, str]) -> dict[str, Any]:
     """Resolve a reference/aggregator slot to real runtime call kwargs.
 
@@ -102,6 +163,7 @@ def _run_reference(
         return label, _extract_text(response) or "(empty response)"
     except Exception as exc:
         logger.warning("MoA reference model %s failed: %s", label, exc)
+        _record_slot_failure(slot, exc)
         return label, f"[failed: {exc}]"
 
 
@@ -132,6 +194,17 @@ def _run_references_parallel(
                 results[idx] = (
                     _slot_label(slot),
                     "[skipped: MoA presets cannot recursively reference MoA]",
+                )
+                continue
+            open_note = _slot_circuit_open(slot)
+            if open_note:
+                logger.info(
+                    "MoA reference %s skipped: provider circuit open (%s)",
+                    _slot_label(slot), open_note,
+                )
+                results[idx] = (
+                    _slot_label(slot),
+                    f"[skipped: provider circuit open — {open_note}]",
                 )
                 continue
             futures[

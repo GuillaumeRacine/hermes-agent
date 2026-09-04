@@ -615,6 +615,24 @@ agent:
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration
   max_turns: 60
 
+  # Hard token budget (prompt + completion tokens as billed by the provider).
+  # max_turns caps iterations; this caps spend.  0 = unlimited.
+  #   per_session        tokens a session may spend before it is stopped
+  #   per_turn           tokens one user turn may spend
+  #   context_soft_limit when one request's prompt_tokens exceeds this, a
+  #                      context-compression pass is forced before the next call
+  #   action             stop (end the turn; reply `continue` for one more turn)
+  #                      or warn (log + status line only)
+  #   platforms          per-platform overrides keyed by platform name
+  # token_budget:
+  #   per_session: 0
+  #   per_turn: 0
+  #   context_soft_limit: 0
+  #   action: stop
+  #   platforms:
+  #     slack: {per_session: 600000, per_turn: 150000}
+  #     cron: {per_session: 300000}
+
   # Inactivity timeout for gateway agent runs (seconds, 0 = unlimited).
   # The agent can run indefinitely when actively calling tools or receiving
   # API responses.  Only fires after the agent has been idle for this duration.

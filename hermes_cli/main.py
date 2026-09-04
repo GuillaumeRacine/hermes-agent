@@ -63,6 +63,10 @@ except ModuleNotFoundError:
 
 import os
 import sys
+import time as _process_time
+
+
+_PROCESS_STARTED_MONOTONIC = _process_time.monotonic()
 
 
 def _set_process_title() -> None:
@@ -2205,6 +2209,9 @@ def _resolve_use_tui(args) -> bool:
 
 def cmd_chat(args):
     """Run interactive chat CLI."""
+    # Fast and full parser paths both arrive here. Apply flags before even the
+    # display-interface lookup imports user configuration.
+    _apply_chat_runtime_env(args)
     use_tui = _resolve_use_tui(args)
 
     # Resolve --continue into --resume with the latest session or by name
@@ -2307,45 +2314,13 @@ def cmd_chat(args):
         except Exception:
             pass
 
-    # Sync bundled skills on every CLI launch (fast -- skips unchanged skills)
-    try:
-        _sync_bundled_skills_for_startup()
-    except Exception:
-        pass
-
-    # --yolo: bypass all dangerous command approvals
-    if getattr(args, "yolo", False):
-        os.environ["HERMES_YOLO_MODE"] = "1"
-
-    # --safe-mode: troubleshooting mode that disables ALL customizations.
-    # Inspired by Claude Code v2.1.169's --safe-mode (June 2026): run with a
-    # pristine environment to isolate whether a problem comes from the user's
-    # setup (config, rules files, plugins, MCP servers) or from Hermes itself.
-    # Implemented as a superset of --ignore-user-config + --ignore-rules plus
-    # plugin/MCP discovery suppression (HERMES_SAFE_MODE is checked by
-    # hermes_cli/plugins.py and tools/mcp_tool.py).
-    if getattr(args, "safe_mode", False):
-        os.environ["HERMES_SAFE_MODE"] = "1"
-        os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
-        os.environ["HERMES_IGNORE_RULES"] = "1"
-
-    # --ignore-user-config: make load_cli_config() / load_config() skip the
-    # user's ~/.hermes/config.yaml and return built-in defaults. Set BEFORE
-    # importing cli (which runs `CLI_CONFIG = load_cli_config()` at module
-    # import time). Credentials in .env are still loaded — this flag only
-    # ignores behavioral/config settings.
-    if getattr(args, "ignore_user_config", False):
-        os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
-
-    # --ignore-rules: skip auto-injection of AGENTS.md/SOUL.md/.cursorrules
-    # (rules), memory entries, and any preloaded skills coming from user config.
-    # Maps to AIAgent(skip_context_files=True, skip_memory=True).
-    if getattr(args, "ignore_rules", False):
-        os.environ["HERMES_IGNORE_RULES"] = "1"
-
-    # --source: tag session source for filtering (e.g. 'tool' for third-party integrations)
-    if getattr(args, "source", None):
-        os.environ["HERMES_SESSION_SOURCE"] = args.source
+    # Prompt-first CLI launches perform this before the first real agent turn.
+    # The user can begin typing while extension startup remains deferred.
+    if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
+        try:
+            _sync_bundled_skills_for_startup()
+        except Exception:
+            pass
 
     _pin_kanban_board_env()
 
@@ -11875,14 +11850,36 @@ def _set_chat_arg_defaults(args) -> None:
             setattr(args, attr, default)
 
 
-def _try_termux_fast_cli_launch() -> bool:
-    """Run obvious Termux non-TUI chat/oneshot/version paths on a light parser."""
-    if not _is_termux_startup_environment():
+def _apply_chat_runtime_env(args) -> None:
+    """Apply chat runtime flags before config/plugin imports can observe them."""
+    if getattr(args, "yolo", False):
+        os.environ["HERMES_YOLO_MODE"] = "1"
+    if getattr(args, "safe_mode", False):
+        os.environ["HERMES_SAFE_MODE"] = "1"
+        os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
+        os.environ["HERMES_IGNORE_RULES"] = "1"
+    if getattr(args, "ignore_user_config", False):
+        os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
+    if getattr(args, "ignore_rules", False):
+        os.environ["HERMES_IGNORE_RULES"] = "1"
+    if getattr(args, "source", None):
+        os.environ["HERMES_SESSION_SOURCE"] = args.source
+
+
+def _try_fast_cli_launch() -> bool:
+    """Run an unambiguous classic CLI launch on the lightweight parser.
+
+    Termux keeps its existing bare/version/oneshot fast paths. On desktop,
+    explicit ``--cli`` interactive launches also use the prompt-first path so
+    plugin, MCP, hook, and bundled-skill setup cannot delay the input field.
+    """
+    is_termux = _is_termux_startup_environment()
+    argv = sys.argv[1:]
+    if not is_termux and "--cli" not in argv:
         return False
-    if os.environ.get("HERMES_TERMUX_DISABLE_FAST_CLI") == "1":
+    if is_termux and os.environ.get("HERMES_TERMUX_DISABLE_FAST_CLI") == "1":
         return False
 
-    argv = sys.argv[1:]
     if "-h" in argv or "--help" in argv:
         return False
     # Let the TUI fast path (or full dispatch) handle anything that resolves to
@@ -11908,6 +11905,7 @@ def _try_termux_fast_cli_launch() -> bool:
     parser, _subparsers, chat_parser = build_top_level_parser()
     chat_parser.set_defaults(func=cmd_chat)
     args = parser.parse_args(_coalesce_session_name_args(argv))
+    _apply_chat_runtime_env(args)
 
     if getattr(args, "version", False):
         _print_version_info(check_updates=False)
@@ -11946,6 +11944,13 @@ def _try_termux_fast_cli_launch() -> bool:
         return True
 
     return False
+
+
+def _try_termux_fast_cli_launch() -> bool:
+    """Backward-compatible Termux-only entrypoint for tests and integrations."""
+    if not _is_termux_startup_environment():
+        return False
+    return _try_fast_cli_launch()
 
 
 def _try_termux_fast_tui_launch() -> bool:
@@ -12182,7 +12187,7 @@ def main():
 
     if _try_termux_fast_tui_launch():
         return
-    if _try_termux_fast_cli_launch():
+    if _try_fast_cli_launch():
         return
 
     from hermes_cli._parser import build_top_level_parser
@@ -13317,6 +13322,12 @@ def main():
     else:
         subparsers.required = False
         args = parser.parse_args(_processed_argv)
+
+    # These flags affect config and extension discovery, so apply them before
+    # _prepare_agent_startup() imports either subsystem. In particular,
+    # --safe-mode must suppress plugin discovery rather than taking effect
+    # later inside cmd_chat().
+    _apply_chat_runtime_env(args)
 
     # Handle --version flag
     if args.version:

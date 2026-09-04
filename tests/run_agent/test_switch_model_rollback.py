@@ -46,6 +46,7 @@ def _make_agent_openrouter():
     agent._fallback_chain = []
     agent._fallback_model = None
     agent._config_context_length = None
+    agent._circuit_provider = "openrouter"
 
     return agent
 
@@ -73,6 +74,7 @@ def _make_agent_anthropic():
     agent._fallback_chain = []
     agent._fallback_model = None
     agent._config_context_length = None
+    agent._circuit_provider = "anthropic"
 
     return agent
 
@@ -200,5 +202,7 @@ def test_successful_switch_still_works_after_rollback_refactor():
 
     assert agent.model == "openai/gpt-5"
     assert agent.provider == "openrouter"
+    assert agent._circuit_provider == "openrouter"
+    assert agent._primary_runtime["circuit_provider"] == "openrouter"
     assert agent.api_key == "or-key-new"
     assert agent.client is new_client

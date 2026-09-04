@@ -31,15 +31,23 @@ The classifier assigns each message to one class:
 - `C4`: production, deployment, billing, payment, destructive, or incident
   work that also needs a different-provider critic.
 
-Rules are explicit and do not call a model. Telemetry contains the class,
-feature counts, current route, shadow recommendation, and a process-keyed
-fingerprint. It never contains the prompt. A private task suppresses a
-recommendation whose runtime provider is not allowlisted.
+Rules are explicit and do not call a model. Each decision receives a random
+opaque `decision_id`. Telemetry contains the class, feature counts, current
+route, shadow recommendation, and a process-keyed fingerprint. A correlated
+`route_outcome` adds only the actual route, completion/failure class, latency,
+API/fallback counts, context size, token/cache/reasoning count deltas, and
+estimated cost delta. `startup_ready` records classic-CLI input-readiness
+latency. These events never contain prompt or response content, raw provider
+errors, session/account identifiers, access tokens, or credentials. A private
+task suppresses a recommendation whose runtime provider is not allowlisted.
 
 The policy generator must treat output quality as a hard gate before optimizing
 latency and cost. A route is not promotion-eligible until it also has the
 required sample count, observation span, error rate, privacy compatibility, and
 independent critic where required. Shadow mode never applies a selected route.
+Live outcomes can quarantine a route or trigger controlled evaluation, but
+cannot promote one; signed eval/canary evidence and the configured independent
+Claude/Codex review remain mandatory.
 
 ## Authentication Recovery
 

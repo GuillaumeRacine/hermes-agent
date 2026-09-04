@@ -345,6 +345,46 @@ def test_termux_fast_cli_launch_bare_defers_agent_startup(monkeypatch, main_mod)
     assert os.environ["HERMES_FAST_STARTUP_BANNER"] == "1"
 
 
+def test_desktop_explicit_cli_launch_defers_agent_startup(monkeypatch, main_mod):
+    captured = {}
+    prepared = []
+
+    monkeypatch.delenv("TERMUX_VERSION", raising=False)
+    monkeypatch.setenv("PREFIX", "/usr")
+    monkeypatch.delenv("HERMES_TUI", raising=False)
+    monkeypatch.delenv("HERMES_DEFER_AGENT_STARTUP", raising=False)
+    monkeypatch.delenv("HERMES_FAST_STARTUP_BANNER", raising=False)
+    monkeypatch.setattr(sys, "argv", ["hermes", "--cli", "--safe-mode"])
+    monkeypatch.setattr(
+        main_mod, "_prepare_agent_startup", lambda args: prepared.append(args.command)
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "cmd_chat",
+        lambda args: captured.update(
+            {
+                "query": args.query,
+                "command": args.command,
+                "compact": getattr(args, "compact", False),
+            }
+        ),
+    )
+
+    assert main_mod._try_fast_cli_launch() is True
+    assert prepared == []
+    assert captured == {"query": None, "command": None, "compact": True}
+    assert os.environ["HERMES_DEFER_AGENT_STARTUP"] == "1"
+    assert os.environ["HERMES_SAFE_MODE"] == "1"
+
+
+def test_desktop_bare_cli_keeps_full_dispatch(monkeypatch, main_mod):
+    monkeypatch.delenv("TERMUX_VERSION", raising=False)
+    monkeypatch.setenv("PREFIX", "/usr")
+    monkeypatch.setattr(sys, "argv", ["hermes"])
+
+    assert main_mod._try_fast_cli_launch() is False
+
+
 def test_termux_fast_cli_launch_oneshot_uses_light_parser(monkeypatch, main_mod):
     captured = {}
     prepared = []

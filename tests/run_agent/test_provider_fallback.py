@@ -7,7 +7,19 @@ advancement through multiple providers.
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from run_agent import AIAgent, _pool_may_recover_from_rate_limit
+from hermes_cli.provider_circuits import record_failure
+
+
+@pytest.fixture(autouse=True)
+def _disable_provider_circuits_by_default(monkeypatch):
+    """Keep legacy fallback tests independent of workstation circuit state."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"provider_circuits": {"enabled": False}},
+    )
 
 
 def _make_agent(fallback_model=None):
@@ -181,6 +193,221 @@ class TestFallbackChainAdvancement:
         ):
             assert agent._try_activate_fallback() is True
             assert mock_rpc.call_args.kwargs["explicit_api_key"] == "env-secret"
+
+    def test_skips_open_circuit_and_uses_next_fallback(self, tmp_path):
+        path = tmp_path / "provider-circuits.json"
+        record_failure(
+            "zai",
+            "glm-5.2",
+            "rate_limit",
+            retry_after_seconds=3600,
+            path=path,
+            now=1000,
+        )
+        fbs = [
+            {"provider": "zai", "model": "glm-5.2"},
+            {"provider": "openai-codex", "model": "gpt-5.5"},
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        called = []
+
+        def _resolve(provider, model=None, **kwargs):
+            called.append((provider, model))
+            return _mock_client(), model
+
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "provider_circuits": {
+                        "enabled": True,
+                        "state_path": str(path),
+                    }
+                },
+            ),
+            patch("time.time", return_value=1200),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                side_effect=_resolve,
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert called == [("openai-codex", "gpt-5.5")]
+        assert agent._fallback_index == 2
+
+    def test_normalizes_fallback_model_before_circuit_lookup(self):
+        agent = _make_agent(
+            fallback_model=[
+                {
+                    "provider": "anthropic",
+                    "model": "anthropic/claude-sonnet-4.6",
+                }
+            ]
+        )
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"provider_circuits": {"enabled": True}},
+            ),
+            patch(
+                "hermes_cli.provider_circuits.circuit_status",
+                return_value={"status": "open"},
+            ) as status,
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+            ) as resolve,
+        ):
+            assert agent._try_activate_fallback() is False
+
+        assert status.call_args.args == ("anthropic", "claude-sonnet-4-6")
+        resolve.assert_not_called()
+
+    def test_fallback_circuit_check_exception_fails_closed(self):
+        agent = _make_agent(
+            fallback_model=[
+                {"provider": "openai", "model": "gpt-4o"},
+                {"provider": "zai", "model": "glm-5.2"},
+            ]
+        )
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"provider_circuits": {"enabled": True}},
+            ),
+            patch(
+                "hermes_cli.provider_circuits.circuit_status",
+                side_effect=OSError("state unavailable"),
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+            ) as resolve,
+        ):
+            assert agent._try_activate_fallback() is False
+
+        resolve.assert_not_called()
+        assert agent._fallback_index == 2
+
+    def test_open_primary_circuit_activates_fallback_before_request(self, tmp_path):
+        path = tmp_path / "provider-circuits.json"
+        agent = _make_agent(
+            fallback_model=[{"provider": "openai-codex", "model": "gpt-5.5"}]
+        )
+        record_failure(
+            agent.provider,
+            agent.model,
+            "rate_limit",
+            retry_after_seconds=3600,
+            path=path,
+            now=1000,
+        )
+
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "provider_circuits": {
+                        "enabled": True,
+                        "state_path": str(path),
+                    }
+                },
+            ),
+            patch("time.time", return_value=1200),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "gpt-5.5"),
+            ),
+        ):
+            assert agent._restore_primary_runtime() is True
+
+        assert agent.provider == "openai-codex"
+        assert agent.model == "gpt-5.5"
+
+    def test_open_primary_without_fallback_sets_blocked_preflight(self, tmp_path):
+        path = tmp_path / "provider-circuits.json"
+        agent = _make_agent(fallback_model=None)
+        record_failure(
+            agent.provider,
+            agent.model,
+            "rate_limit",
+            retry_after_seconds=3600,
+            path=path,
+            now=1000,
+        )
+
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "provider_circuits": {
+                        "enabled": True,
+                        "state_path": str(path),
+                    }
+                },
+            ),
+            patch("time.time", return_value=1200),
+        ):
+            assert agent._restore_primary_runtime() is False
+
+        assert "no fallback" in agent._provider_circuit_blocked_reason.lower()
+
+    def test_unavailable_circuit_state_blocks_primary_request(self):
+        agent = _make_agent(
+            fallback_model=[{"provider": "openai-codex", "model": "gpt-5.5"}]
+        )
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"provider_circuits": {"enabled": True}},
+            ),
+            patch(
+                "hermes_cli.provider_circuits.circuit_status",
+                return_value={"status": "unavailable"},
+            ),
+            patch.object(agent, "_try_activate_fallback") as activate,
+        ):
+            assert agent._restore_primary_runtime() is False
+
+        activate.assert_not_called()
+        assert "circuit state is unavailable" in (
+            agent._provider_circuit_blocked_reason.lower()
+        )
+
+    def test_open_active_fallback_advances_to_next_healthy_fallback(self):
+        agent = _make_agent(
+            fallback_model=[
+                {"provider": "first", "model": "first-model"},
+                {"provider": "second", "model": "second-model"},
+            ]
+        )
+        agent._fallback_activated = True
+        agent._fallback_index = 1
+        agent.provider = "first"
+        agent.model = "first-model"
+
+        def _status(provider, model, **kwargs):
+            if provider in {agent._primary_runtime["provider"], "first"}:
+                return {"status": "open", "open_until": "later"}
+            return {"status": "closed"}
+
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"provider_circuits": {"enabled": True}},
+            ),
+            patch(
+                "hermes_cli.provider_circuits.circuit_status",
+                side_effect=_status,
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "second-model"),
+            ),
+        ):
+            assert agent._restore_primary_runtime() is True
+
+        assert agent.provider == "second"
+        assert agent.model == "second-model"
 
 
 # ── Pool-rotation vs fallback gating (#11314) ────────────────────────────

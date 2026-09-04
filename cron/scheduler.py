@@ -266,6 +266,12 @@ from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
 
+# Optional Slack-only multipart delimiter. Jobs with
+# ``slack_threaded_delivery: true`` can place this marker between a compact
+# channel parent and each item-level thread reply. The marker is consumed by
+# delivery and never appears in Slack.
+SLACK_THREAD_REPLY_MARKER = "[[SLACK_THREAD_REPLY]]"
+
 # Canonical silence tokens recognized in cron output.  Cron's contract is
 # intentionally looser than the gateway's exact-whole-response rule: the cron
 # system prompt *instructs* the agent to emit "[SILENT]", and real agents often
@@ -1087,6 +1093,105 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
+def _split_slack_threaded_delivery(content: str) -> Optional[List[str]]:
+    """Split a structured Slack cron response into parent + thread replies.
+
+    Returns ``None`` when the marker is absent or the structure is invalid so
+    ordinary one-message cron delivery remains the safe fallback.
+    """
+    if not isinstance(content, str) or SLACK_THREAD_REPLY_MARKER not in content:
+        return None
+    parts = [part.strip() for part in content.split(SLACK_THREAD_REPLY_MARKER)]
+    if len(parts) < 2 or any(not part for part in parts):
+        return None
+    return parts
+
+
+def _split_slack_headline_and_detail(content: str) -> Optional[List[str]]:
+    """Use the first non-empty line as parent for legacy multi-line reports.
+
+    Canonical producers should emit ``SLACK_THREAD_REPLY_MARKER``. This narrow
+    fallback keeps older deterministic scripts from dumping their full report
+    into a channel while they migrate. It never invents or truncates text.
+    """
+    if not isinstance(content, str) or SLACK_THREAD_REPLY_MARKER in content:
+        return None
+    lines = [line.strip() for line in content.strip().splitlines()]
+    lines = [line for line in lines if line]
+    if len(lines) < 2 or len(lines[0]) > 240:
+        return None
+    return [lines[0], "\n".join(lines[1:])]
+
+
+def _run_standalone_delivery(coro_factory):
+    """Run a standalone platform send from sync cron delivery code."""
+    coro = coro_factory()
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        # asyncio.run() cannot nest. Close the unstarted coroutine and retry
+        # in a fresh thread, matching the existing fallback delivery path.
+        coro.close()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, coro_factory())
+            return future.result(timeout=30)
+
+
+def _deliver_slack_threaded_parts(
+    pconfig,
+    chat_id: str,
+    parts: List[str],
+) -> Optional[str]:
+    """Send one Slack parent followed by item-level thread replies."""
+    from gateway.config import Platform
+    from tools.send_message_tool import _send_to_platform
+
+    parent_result = _run_standalone_delivery(
+        lambda: _send_to_platform(Platform.SLACK, pconfig, chat_id, parts[0])
+    )
+    if (
+        not isinstance(parent_result, dict)
+        or not parent_result.get("success")
+        or parent_result.get("error")
+    ):
+        error = (
+            parent_result.get("error", "unconfirmed parent delivery")
+            if isinstance(parent_result, dict)
+            else "unconfirmed parent delivery"
+        )
+        return f"Slack threaded parent delivery failed: {error}"
+
+    parent_ts = str(parent_result.get("message_id") or "")
+    if not parent_ts:
+        return "Slack threaded parent delivery returned no message_id"
+
+    for index, reply in enumerate(parts[1:], start=1):
+        reply_result = _run_standalone_delivery(
+            lambda reply=reply: _send_to_platform(
+                Platform.SLACK,
+                pconfig,
+                chat_id,
+                reply,
+                thread_id=parent_ts,
+            )
+        )
+        if (
+            not isinstance(reply_result, dict)
+            or not reply_result.get("success")
+            or reply_result.get("error")
+        ):
+            error = (
+                reply_result.get("error", "unconfirmed reply delivery")
+                if isinstance(reply_result, dict)
+                else "unconfirmed reply delivery"
+            )
+            return (
+                f"Slack threaded reply {index}/{len(parts) - 1} failed "
+                f"after parent {parent_ts}: {error}"
+            )
+    return None
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -1219,6 +1324,40 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             msg = f"platform '{platform_name}' not configured/enabled"
             logger.warning("Job '%s': %s", job["id"], msg)
             delivery_errors.append(msg)
+            continue
+
+        # Structured Slack output uses one compact parent plus thread replies.
+        # Any Slack cron may emit the marker; requiring a per-job feature flag
+        # caused correctly formatted reports to arrive as one channel wall
+        # when prompts evolved without the matching job metadata. Existing
+        # thread-targeted jobs and media delivery keep their normal path.
+        threaded_parts = (
+            (
+                _split_slack_threaded_delivery(cleaned_delivery_content)
+                or _split_slack_headline_and_detail(cleaned_delivery_content)
+            )
+            if platform_name.lower() == "slack"
+            and not thread_id
+            and not media_files
+            else None
+        )
+        if threaded_parts:
+            threaded_error = _deliver_slack_threaded_parts(
+                pconfig,
+                str(chat_id),
+                threaded_parts,
+            )
+            if threaded_error:
+                logger.error("Job '%s': %s", job["id"], threaded_error)
+                delivery_errors.append(threaded_error)
+            else:
+                logger.info(
+                    "Job '%s': delivered Slack parent + %d thread repl%s to %s",
+                    job["id"],
+                    len(threaded_parts) - 1,
+                    "y" if len(threaded_parts) == 2 else "ies",
+                    chat_id,
+                )
             continue
 
         # Prefer the live adapter when the gateway is running — this supports E2EE
@@ -1729,6 +1868,9 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     """
     user_prompt = str(job.get("prompt") or "")
     prompt = user_prompt
+    prompt_addendum = str(job.get("prompt_addendum") or "").strip()
+    if prompt_addendum:
+        prompt = f"{prompt}\n\n{prompt_addendum}" if prompt else prompt_addendum
     skills = job.get("skills")
     # True when runtime-collected DATA (script stdout, upstream-job output)
     # has been injected into the prompt. Data content legitimately quotes
@@ -2825,7 +2967,15 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         delivery_error = None
         if should_deliver:
             try:
-                delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                delivery_job = job
+                failure_target = os.environ.get("HERMES_CRON_FAILURE_DELIVER", "").strip()
+                if not success and failure_target:
+                    delivery_job = dict(job)
+                    delivery_job["deliver"] = failure_target
+                    delivery_job["origin"] = None
+                delivery_error = _deliver_result(
+                    delivery_job, deliver_content, adapters=adapters, loop=loop
+                )
             except Exception as de:
                 delivery_error = str(de)
                 logger.error("Delivery failed for job %s: %s", job["id"], de)

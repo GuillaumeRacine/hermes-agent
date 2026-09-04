@@ -172,6 +172,9 @@ def build_turn_context(
 
     # Restore the primary runtime if the previous turn activated fallback.
     agent._restore_primary_runtime()
+    _circuit_block = getattr(agent, "_provider_circuit_blocked_reason", None)
+    if _circuit_block:
+        raise RuntimeError(_circuit_block)
 
     # Between-turns MCP refresh: an MCP server that finished connecting since
     # the previous turn (slow HTTP/OAuth servers routinely take 2-6s on a cold

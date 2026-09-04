@@ -897,21 +897,47 @@ DEFAULT_CONFIG = {
     "providers": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
-    # Deterministic task classification and model-route observation.
-    # Shadow mode never changes the active provider/model. It records only
-    # non-content metadata so an external evaluator can compare recommended
-    # routes against the live route before any guarded promotion.
+    # Deterministic task classification and model-route observation. Shadow
+    # never changes the active provider/model. Guarded mode may consume only an
+    # optimizer-approved ``selected`` native Hermes route for a new session;
+    # the caller pins it for that session to preserve context and prompt cache.
     "adaptive_routing": {
         "enabled": False,
         "mode": "shadow",
         "policy_path": "",
         "telemetry_path": "~/.hermes/logs/adaptive-routing.jsonl",
+        "pin_path": "",
+        "maximum_session_pins": 1024,
+        "maximum_policy_age_seconds": 172800,
         "private_provider_allowlist": [
             "local-ollama",
             "openai-codex",
             "xai-oauth",
             "claude-code",
         ],
+    },
+    # Cross-session provider/model circuit breaker. Rate-limit, billing, auth,
+    # and repeated transient failures are remembered in a small secret-safe
+    # state file so new sessions skip a backend until its quota/cooldown reset.
+    "provider_circuits": {
+        "enabled": True,
+        "state_path": "",
+        "transient_failure_threshold": 3,
+        "maximum_cooldown_seconds": 2592000,
+        "probe_lease_seconds": 120,
+        "max_entries": 256,
+        "stale_record_days": 90,
+        "cooldown_seconds": {
+            "rate_limit": 3600,
+            "billing": 86400,
+            "auth": 86400,
+            "auth_permanent": 86400,
+            "overloaded": 300,
+            "server_error": 180,
+            "timeout": 180,
+            "model_not_found": 86400,
+            "unknown": 180,
+        },
     },
     "toolsets": ["hermes-cli"],
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.

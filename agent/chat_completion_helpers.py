@@ -1136,6 +1136,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    if reason is not None:
+        record_provider_failure(agent, reason)
+
     if reason in {FailoverReason.rate_limit, FailoverReason.billing}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
@@ -1154,6 +1157,66 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
         return agent._try_activate_fallback()  # skip invalid, try next
+
+    # Circuit keys use the canonical model sent to the provider. Normalize
+    # before the lookup so aliases/vendor-prefixed config cannot bypass an
+    # already-open circuit.
+    try:
+        from hermes_cli.model_normalize import normalize_model_for_provider
+
+        fb_model = normalize_model_for_provider(fb_model, fb_provider)
+    except Exception as _norm_err:
+        logger.warning(
+            "Could not normalize fallback model %r for provider %r: %s",
+            fb_model,
+            fb_provider,
+            _norm_err,
+        )
+
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.provider_circuits import (
+            circuit_status,
+            claim_probe,
+            state_path,
+        )
+
+        _circuit_config = load_config()
+        if (_circuit_config.get("provider_circuits") or {}).get("enabled", True):
+            _status = circuit_status(
+                fb_provider,
+                fb_model,
+                path=state_path(_circuit_config),
+            )
+            if _status["status"] == "probe_eligible" and not claim_probe(
+                fb_provider,
+                fb_model,
+                path=state_path(_circuit_config),
+                config=_circuit_config,
+            ):
+                _status = {"status": "open", "open_until": "probe lease"}
+            if _status["status"] == "open":
+                logger.warning(
+                    "Fallback skip: circuit open for %s/%s until %s (%s)",
+                    fb_provider,
+                    fb_model,
+                    _status.get("open_until") or "unknown",
+                    _status.get("reason") or "unknown",
+                )
+                return agent._try_activate_fallback()
+            if _status["status"] == "unavailable":
+                logger.warning(
+                    "Fallback skip: provider circuit state is unavailable"
+                )
+                return agent._try_activate_fallback()
+    except Exception:
+        logger.warning(
+            "Provider circuit fallback check failed closed for %s/%s",
+            fb_provider,
+            fb_model,
+            exc_info=True,
+        )
+        return agent._try_activate_fallback()
 
     # Skip entries that resolve to the current (provider, model) — falling
     # back to the same backend that just failed loops the failure. Compare
@@ -1211,16 +1274,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "Fallback to %s failed: provider not configured",
                 fb_provider)
             return agent._try_activate_fallback()  # try next in chain
-        try:
-            from hermes_cli.model_normalize import normalize_model_for_provider
-
-            fb_model = normalize_model_for_provider(fb_model, fb_provider)
-        except Exception as _norm_err:
-            logger.warning(
-                "Could not normalize fallback model %r for provider %r: %s",
-                fb_model, fb_provider, _norm_err,
-            )
-
         # Determine api_mode from provider / base URL / model
         fb_api_mode = "chat_completions"
         fb_base_url = str(fb_client.base_url)
@@ -1257,6 +1310,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent._config_context_length = None
         agent.model = fb_model
         agent.provider = fb_provider
+        agent._circuit_provider = fb_provider
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
         if hasattr(agent, "_transport_cache"):
@@ -1403,6 +1457,44 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     except Exception as e:
         logger.error("Failed to activate fallback %s: %s", fb_model, e)
         return agent._try_activate_fallback()  # try next in chain
+
+
+def record_provider_failure(agent, reason: "FailoverReason") -> None:
+    """Persist one provider failure without forcing a fallback transition."""
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.provider_circuits import record_failure
+
+        _circuit_config = load_config()
+        if (_circuit_config.get("provider_circuits") or {}).get("enabled", True):
+            record_failure(
+                getattr(agent, "_circuit_provider", None)
+                or getattr(agent, "provider", ""),
+                getattr(agent, "model", ""),
+                reason,
+                agent=agent,
+                config=_circuit_config,
+            )
+    except Exception:
+        logger.debug("Provider circuit failure recording skipped", exc_info=True)
+
+
+def record_provider_success(agent) -> None:
+    """Reset eligible circuit failure state after a validated provider response."""
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.provider_circuits import record_success
+
+        _circuit_config = load_config()
+        if (_circuit_config.get("provider_circuits") or {}).get("enabled", True):
+            record_success(
+                getattr(agent, "_circuit_provider", None)
+                or getattr(agent, "provider", ""),
+                getattr(agent, "model", ""),
+                config=_circuit_config,
+            )
+    except Exception:
+        logger.debug("Provider circuit success recording skipped", exc_info=True)
 
 
 
@@ -2834,6 +2926,7 @@ __all__ = [
     "build_api_kwargs",
     "build_assistant_message",
     "try_activate_fallback",
+    "record_provider_success",
     "handle_max_iterations",
     "cleanup_task_resources",
     "interruptible_streaming_api_call",

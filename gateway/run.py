@@ -43,7 +43,7 @@ import sqlite3
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional, Any, List, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
@@ -8786,6 +8786,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "usage":
             return await self._handle_usage_command(event)
 
+        if canonical == "pending":
+            return await self._handle_pending_command(event)
+
         if canonical == "credits":
             return await self._handle_credits_command(event)
 
@@ -15210,19 +15213,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-            )
+        # Degraded-mode honesty gate (hermes-home #233 P0-1). When every capable
+        # provider is exhausted, do NOT construct/run the agent: queue the
+        # message in the pending-intents ledger and answer with the fixed
+        # notice through the normal reply path. Fail-open on any error.
+        _ledger_text = (persist_user_message or message or "")
+        if _interrupt_depth == 0:
+            try:
+                _gated = self._degraded_mode_gate(
+                    message=_ledger_text,
+                    source=source,
+                    session_id=session_id,
+                    session_key=session_key,
+                )
+            except Exception:
+                logger.warning(
+                    "degraded_mode gate failed; running the normal agent path",
+                    exc_info=True,
+                )
+                _gated = None
+            if _gated is not None:
+                return _gated
 
-        profile_home = self._resolve_profile_home_for_source(source)
-        with _profile_runtime_scope(profile_home):
-            return await self._run_agent_inner(
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            _result = await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
@@ -15230,6 +15244,370 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
             )
+        else:
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                _result = await self._run_agent_inner(
+                    message, context_prompt, history, source, session_id,
+                    session_key=session_key, run_generation=run_generation,
+                    _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                    channel_prompt=channel_prompt, moa_config=moa_config,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                )
+
+        # Dropped-request ledger (hermes-home #233 P3-11): a turn that ended on
+        # a sub-floor runtime, or was interrupted by a gateway shutdown, leaves
+        # the user's message unanswered — record it so it survives and replays.
+        try:
+            self._record_degraded_post_turn(
+                _result,
+                message=_ledger_text,
+                source=source,
+                session_id=session_id,
+                session_key=session_key,
+            )
+        except Exception:
+            logger.warning("pending-intents post-turn record failed", exc_info=True)
+        return _result
+
+    # ── Degraded-mode honesty gate + pending-intents ledger (hermes-home #233) ──
+
+    _DEGRADED_NOTICE_INTERVAL_S = 3600.0
+
+    @staticmethod
+    def _degraded_runtime_config() -> Dict[str, Any]:
+        from hermes_cli.config import load_config
+
+        return load_config() or {}
+
+    @staticmethod
+    def _degraded_source_snapshot(source: SessionSource) -> Dict[str, Any]:
+        """Serializable subset of SessionSource needed to rebuild it on replay."""
+        snap: Dict[str, Any] = {}
+        for field_name in (
+            "chat_name", "chat_type", "user_name", "chat_topic", "user_id_alt",
+            "chat_id_alt", "guild_id", "parent_chat_id", "profile",
+        ):
+            value = getattr(source, field_name, None)
+            if value is not None:
+                snap[field_name] = value
+        return snap
+
+    @staticmethod
+    def _degraded_source_from_record(record: Dict[str, Any]) -> SessionSource:
+        meta = record.get("metadata") or {}
+        snap = dict(meta.get("source") or {})
+        kwargs: Dict[str, Any] = {
+            "platform": Platform(str(record.get("platform") or "")),
+            "chat_id": str(record.get("chat_id") or ""),
+            "user_id": record.get("user_id"),
+            "thread_id": record.get("thread_id"),
+        }
+        for key in (
+            "chat_name", "chat_type", "user_name", "chat_topic", "user_id_alt",
+            "chat_id_alt", "guild_id", "parent_chat_id", "profile",
+        ):
+            if key in snap and snap[key] is not None:
+                kwargs[key] = snap[key]
+        return SessionSource(**kwargs)
+
+    def _degraded_last_notified_at(self, chat_key: str, queue_path) -> Optional[float]:
+        """Last notice time for ``chat_key`` (memory first, then ledger metadata)."""
+        memo = getattr(self, "_degraded_notified_at", None)
+        if memo is None:
+            memo = {}
+            self._degraded_notified_at = memo
+        if chat_key in memo:
+            return memo[chat_key]
+        # Cold start after a restart: recover the newest persisted stamp.
+        from agent import pending_intents as pi
+
+        latest: Optional[float] = None
+        try:
+            platform_value, _, chat_id = chat_key.partition(":")
+            for rec in pi.list_all(path=queue_path):
+                if str(rec.get("platform")) != platform_value or str(rec.get("chat_id")) != chat_id:
+                    continue
+                stamp = (rec.get("metadata") or {}).get("last_notified_at")
+                if not stamp:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+                except (TypeError, ValueError):
+                    continue
+                if latest is None or ts > latest:
+                    latest = ts
+        except Exception:
+            logger.debug("pending-intents last_notified_at lookup failed", exc_info=True)
+        if latest is not None:
+            memo[chat_key] = latest
+        return latest
+
+    def _degraded_mode_gate(
+        self,
+        *,
+        message: str,
+        source: SessionSource,
+        session_id: Optional[str],
+        session_key: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Return a synthetic agent result when no capable runtime is available.
+
+        Returns None to let the normal path run. When gating: the message is
+        appended to the pending-intents ledger (reason ``fallbacks_exhausted``),
+        the full notice is sent once per chat per hour, and further messages in
+        that window get a one-line "still queued (N pending)" reply.
+        """
+        from agent import degraded_mode as dm
+        from agent import pending_intents as pi
+
+        cfg = self._degraded_runtime_config()
+        if not dm.is_enabled(cfg):
+            return None
+        if getattr(self, "_draining", False):
+            return None
+        primary_provider, primary_model = dm.primary_runtime(cfg)
+        if dm.is_sub_floor(primary_provider, primary_model, cfg):
+            # The operator deliberately runs a floor model as primary — the
+            # gate would block every message. Treat as misconfiguration and
+            # fail open (warn once).
+            if not getattr(self, "_degraded_primary_warned", False):
+                logger.warning(
+                    "degraded_mode: primary runtime %s/%s matches the floor; "
+                    "gate disabled (adjust degraded_mode.floor or model)",
+                    primary_provider, primary_model,
+                )
+                self._degraded_primary_warned = True
+            return None
+
+        verdict = dm.assess(cfg)
+        if verdict["available"]:
+            return None
+        text = (message or "").strip()
+        if not text:
+            return None
+        platform_value = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+        chat_id = str(source.chat_id or "")
+        chat_key = f"{platform_value}:{chat_id}"
+        queue_path = pi.queue_path(cfg)
+        record = pi.new_record(
+            platform=platform_value,
+            chat_id=chat_id,
+            user_id=source.user_id,
+            thread_id=source.thread_id,
+            text=text,
+            reason="fallbacks_exhausted",
+            session_id=session_id,
+            metadata={
+                "session_key": session_key,
+                "source": self._degraded_source_snapshot(source),
+                "detail": verdict["detail"],
+                "eta": verdict["eta"],
+            },
+        )
+        record_id = pi.enqueue(record, path=queue_path)
+
+        now = time.time()
+        last = self._degraded_last_notified_at(chat_key, queue_path)
+        if last is None or (now - last) >= self._DEGRADED_NOTICE_INTERVAL_S:
+            self._degraded_notified_at[chat_key] = now
+            stamp = datetime.fromtimestamp(now, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+            pi.update_metadata(record_id, {"last_notified_at": stamp, "notified": True}, path=queue_path)
+            reply = verdict["notice"]
+        else:
+            pending_count = pi.count_pending(path=queue_path, chat_id=chat_id)
+            reply = f"Still queued ({pending_count} pending) — will replay when a capable model is back."
+
+        logger.warning(
+            "degraded_mode: no capable runtime (%s) — queued %s message as %s "
+            "(reason=fallbacks_exhausted, chat=%s)",
+            verdict["detail"], platform_value, record_id, chat_id,
+        )
+        return {
+            "final_response": reply,
+            "messages": [],
+            "api_calls": 0,
+            "completed": False,
+            "failed": False,
+            "partial": False,
+            "interrupted": False,
+            "error": None,
+            "interrupt_message": None,
+            "tools": [],
+            "history_offset": 0,
+            "compacted_in_place": False,
+            "session_id": session_id,
+            "degraded_mode": True,
+            "pending_intent_id": record_id,
+        }
+
+    def _record_degraded_post_turn(
+        self,
+        result: Any,
+        *,
+        message: str,
+        source: SessionSource,
+        session_id: Optional[str],
+        session_key: Optional[str],
+    ) -> Optional[str]:
+        """Append a ledger record for turns that left the user's message unanswered.
+
+        * ``turn_exit_reason == degraded_sub_floor`` → reason ``sub_floor_model``
+          (the fallback chain reached a floor model mid-turn).
+        * ``interrupted`` while the gateway is draining (shutdown/restart) →
+          reason ``interrupted`` with ``metadata.user_initiated = False``.
+          A user-issued stop/steer (not draining) is deliberately NOT recorded.
+        """
+        if not isinstance(result, dict):
+            return None
+        from agent import degraded_mode as dm
+        from agent import pending_intents as pi
+
+        reason: Optional[str] = None
+        extra: Dict[str, Any] = {}
+        if result.get("turn_exit_reason") == dm.SUB_FLOOR_EXIT_REASON:
+            reason = "sub_floor_model"
+        elif result.get("interrupted") and getattr(self, "_draining", False):
+            reason = "interrupted"
+            extra["user_initiated"] = False
+            extra["restart_requested"] = bool(getattr(self, "_restart_requested", False))
+        if reason is None:
+            return None
+        text = (message or "").strip()
+        if not text:
+            return None
+        cfg = self._degraded_runtime_config()
+        if not dm.is_enabled(cfg):
+            return None
+        platform_value = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+        record = pi.new_record(
+            platform=platform_value,
+            chat_id=str(source.chat_id or ""),
+            user_id=source.user_id,
+            thread_id=source.thread_id,
+            text=text,
+            reason=reason,
+            session_id=result.get("session_id") or session_id,
+            metadata={
+                "session_key": session_key,
+                "source": self._degraded_source_snapshot(source),
+                "turn_exit_reason": result.get("turn_exit_reason"),
+                **extra,
+            },
+        )
+        record_id = pi.enqueue(record, path=pi.queue_path(cfg))
+        logger.warning(
+            "pending-intents: recorded %s message as %s (reason=%s, chat=%s)",
+            platform_value, record_id, reason, source.chat_id,
+        )
+        return record_id
+
+    async def _replay_pending_intents(self) -> int:
+        """Replay queued user messages once a capable runtime is back.
+
+        Oldest first, serial per chat. Each record is re-injected through the
+        adapter's inbound path (``adapter.handle_message``) exactly like a
+        fresh platform message, with ``_hermes_replayed_from=<id>`` set on the
+        event. Records older than ``replay_max_age_hours`` are expired
+        silently. Returns the number of replayed records.
+        """
+        from agent import degraded_mode as dm
+        from agent import pending_intents as pi
+        from gateway.platforms.base import MessageEvent as _MessageEvent
+
+        if getattr(self, "_degraded_replay_inflight", False):
+            return 0
+        self._degraded_replay_inflight = True
+        replayed = 0
+        try:
+            cfg = self._degraded_runtime_config()
+            if not dm.is_enabled(cfg):
+                return 0
+            block = dm.degraded_config(cfg)
+            max_age = float(block.get("replay_max_age_hours") or 24)
+            queue_path = pi.queue_path(cfg)
+            expired = pi.expire_stale(max_age, path=queue_path)
+            if expired:
+                logger.info("pending-intents: expired %d stale record(s)", len(expired))
+            pending = pi.list_pending(max_age, path=queue_path)
+            if not pending or getattr(self, "_draining", False):
+                return 0
+            verdict = dm.assess(cfg)
+            if not verdict["available"]:
+                return 0
+            capable = verdict["detail"]
+            logger.info(
+                "pending-intents: %s is back — replaying %d queued message(s)",
+                capable, len(pending),
+            )
+            prefaced: set = set()
+            for rec in pending:
+                if getattr(self, "_draining", False):
+                    break
+                try:
+                    source = self._degraded_source_from_record(rec)
+                except Exception:
+                    logger.debug("pending-intents: unreadable record %s", rec.get("id"), exc_info=True)
+                    pi.mark(str(rec.get("id")), "expired", path=queue_path,
+                            metadata={"error": "unreadable_source"})
+                    continue
+                adapter = self.adapters.get(source.platform)
+                if adapter is None:
+                    # Platform not connected in this gateway — leave it pending.
+                    continue
+                # Re-check between records so a mid-replay quota event stops
+                # the loop instead of feeding the rest into the gate again.
+                if not dm.capable_runtime_available(cfg)[0]:
+                    break
+                chat_key = (source.platform.value, source.chat_id, source.thread_id)
+                if chat_key not in prefaced:
+                    prefaced.add(chat_key)
+                    try:
+                        created = rec.get("created_at") or "earlier"
+                        try:
+                            _dt = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+                            created = _dt.astimezone().strftime("%Y-%m-%d %H:%M")
+                        except (TypeError, ValueError):
+                            pass
+                        await adapter.send(
+                            source.chat_id,
+                            f"Replaying your message from {created} now that {capable} is back.",
+                            metadata=self._thread_metadata_for_source(source),
+                        )
+                    except Exception:
+                        logger.debug("pending-intents: preface send failed", exc_info=True)
+                event = _MessageEvent(text=str(rec.get("text") or ""), source=source)
+                try:
+                    setattr(event, "_hermes_replayed_from", rec.get("id"))
+                except Exception:
+                    pass
+                # At-most-once: mark before dispatch so a crash mid-turn can
+                # never replay the same request twice.
+                pi.mark(str(rec.get("id")), "replayed", path=queue_path,
+                        metadata={"replayed_by": capable})
+                try:
+                    await adapter.handle_message(event)
+                    # Serial per chat: wait for this session's turn to finish
+                    # before injecting the next queued message.
+                    session_tasks = getattr(adapter, "_session_tasks", None)
+                    if isinstance(session_tasks, dict):
+                        try:
+                            session_key = self._session_key_for_source(source)
+                        except Exception:
+                            session_key = None
+                        task = session_tasks.get(session_key) if session_key else None
+                        if task is not None:
+                            await asyncio.shield(task)
+                except Exception:
+                    logger.warning(
+                        "pending-intents: replay of %s failed", rec.get("id"), exc_info=True,
+                    )
+                    continue
+                replayed += 1
+            return replayed
+        finally:
+            self._degraded_replay_inflight = False
 
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
         """Resolve which profile's HERMES_HOME should serve this inbound source.
@@ -17066,6 +17444,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "partial": result.get("partial", False),
                     "completed": result.get("completed"),
                     "interrupted": result.get("interrupted", False),
+                    "turn_exit_reason": result.get("turn_exit_reason"),
                     "interrupt_message": result.get("interrupt_message"),
                     "error": result.get("error"),
                     "compression_exhausted": result.get("compression_exhausted", False),
@@ -17163,6 +17542,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return {
                 "final_response": final_response,
                 "last_reasoning": result.get("last_reasoning"),
+                "turn_exit_reason": result.get("turn_exit_reason") if isinstance(result, dict) else None,
                 "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                 "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
                 "completed": result_holder[0].get("completed") if result_holder[0] else None,
@@ -18138,7 +18518,7 @@ def _run_planned_stop_watcher(
         stop_event.wait(poll_interval)
 
 
-def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
+def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60, runner=None):
     """Background thread for gateway-only periodic chores (NOT cron).
 
     Split out of the historical ``_start_cron_ticker`` so the cron *trigger*
@@ -18159,11 +18539,33 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     CHANNEL_DIR_EVERY = 5    # ticks — every 5 minutes
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
+    # Pending-intents replay (hermes-home #233 P3-11): every
+    # degraded_mode.replay_interval_seconds (default 300s) check whether a
+    # capable runtime is back and replay queued user messages.
+    REPLAY_EVERY = 5
+    try:
+        from hermes_cli.config import load_config as _hk_load_config
+        _replay_secs = float(
+            ((_hk_load_config() or {}).get("degraded_mode") or {}).get("replay_interval_seconds") or 300
+        )
+        REPLAY_EVERY = max(1, int(round(_replay_secs / max(1, interval))))
+    except Exception:
+        pass
 
     logger.info("Gateway housekeeping started (interval=%ds)", interval)
     tick_count = 0
     while not stop_event.is_set():
         tick_count += 1
+
+        if runner is not None and loop is not None and tick_count % REPLAY_EVERY == 0:
+            try:
+                safe_schedule_threadsafe(
+                    runner._replay_pending_intents(), loop,
+                    logger=logger,
+                    log_message="Pending-intents replay scheduling error",
+                )
+            except Exception as e:
+                logger.debug("Pending-intents replay error: %s", e)
 
         if tick_count % CHANNEL_DIR_EVERY == 0 and adapters:
             try:
@@ -18699,7 +19101,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     housekeeping_thread = threading.Thread(
         target=_start_gateway_housekeeping,
         args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop(), "runner": runner},
         daemon=True,
         name="gateway-housekeeping",
     )

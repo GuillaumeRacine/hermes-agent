@@ -1298,6 +1298,18 @@ def try_activate_fallback(
             agent._transport_cache.clear()
         agent._fallback_activated = True
 
+        # Degraded-mode honesty gate (hermes-home #233 P0-1): a fallback that
+        # lands on a sub-floor runtime (tiny local model) may still serve
+        # auxiliary work, but it must NOT answer as the agent. Flag the agent
+        # so the conversation loop ends the turn with the fixed notice instead
+        # of asking a 3B model to impersonate the assistant.
+        try:
+            from agent.degraded_mode import mark_agent_sub_floor_if_needed
+
+            mark_agent_sub_floor_if_needed(agent, fb_provider, fb_model)
+        except Exception:
+            logger.debug("degraded_mode sub-floor check failed (fail-open)", exc_info=True)
+
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream
         # recovery (rate_limit / billing / auth) mutate the wrong credential

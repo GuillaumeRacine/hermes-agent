@@ -233,6 +233,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("restart", "Gracefully restart the gateway after draining active runs", "Session",
                gateway_only=True),
     CommandDef("usage", "Show token usage and rate limits for the current session", "Info"),
+    CommandDef("pending", "List queued messages waiting for a capable model (degraded mode)", "Info",
+               gateway_only=True, args_hint="[all]"),
     CommandDef("credits", "Show Nous credit balance and top up", "Info"),
     CommandDef("billing", "Manage Nous terminal billing — buy credits, auto-reload, limits", "Info",
                cli_only=True),
@@ -1169,8 +1171,10 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - auth: recovery remains directly typeable as ``!auth`` in Slack threads;
 #     native slash users reach it through ``/hermes auth`` so it does not evict
 #     an existing command from Slack's 50-command manifest cap.
+#   - pending: degraded-mode queue listing (hermes-home #233); low-frequency,
+#     reached via /hermes pending on Slack so it does not evict a native slot.
 _SLACK_VIA_HERMES_ONLY = frozenset(
-    {"credits", "billing", "moa", "debug", "auth"}
+    {"credits", "billing", "moa", "debug", "auth", "pending"}
 )
 
 

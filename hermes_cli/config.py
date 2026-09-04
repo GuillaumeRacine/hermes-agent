@@ -939,6 +939,29 @@ DEFAULT_CONFIG = {
             "unknown": 180,
         },
     },
+    # Degraded-mode honesty gate (hermes-home #233 P0-1/P3-11). When every
+    # capable provider is exhausted and the fallback chain would land on a
+    # sub-floor runtime (a tiny local model), the gateway must NOT answer as
+    # the agent. It replies with a fixed notice, records the user's message in
+    # the pending-intents ledger, and replays it once a capable model is back.
+    "degraded_mode": {
+        "enabled": True,
+        "floor": {
+            # Any model served by these providers is sub-floor.
+            "providers": ["local-ollama", "ollama"],
+            # Optional explicit model globs (fnmatch), e.g. ["*:3b", "*-mini"].
+            "models": [],
+        },
+        # Ledger path. Empty = HERMES_HOME/state/pending_intents.jsonl
+        "queue_path": "",
+        "replay_max_age_hours": 24,
+        "replay_interval_seconds": 300,
+        "notify_template": (
+            "Running on an emergency local model — primary providers are "
+            "exhausted ({detail}). Your message is queued and will be replayed "
+            "automatically when a capable model is back (expected {eta})."
+        ),
+    },
     "toolsets": ["hermes-cli"],
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.

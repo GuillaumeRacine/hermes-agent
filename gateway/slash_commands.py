@@ -3517,6 +3517,51 @@ class GatewaySlashCommandsMixin:
             lines.append("Complete your top-up in the browser — credits will appear in /credits shortly.")
         return "\n".join(lines)
 
+    async def _handle_pending_command(self, event: MessageEvent) -> str:
+        """Handle /pending — list queued user messages in the pending-intents ledger.
+
+        ``/pending`` shows this chat's queue; ``/pending all`` shows every chat.
+        Records are written by the degraded-mode gate (hermes-home #233).
+        """
+        from agent import degraded_mode as dm
+        from agent import pending_intents as pi
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        args = (event.get_command_args() or "").strip().lower()
+        show_all = args in {"all", "*"}
+        source = event.source
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        max_age = float((dm.degraded_config(cfg).get("replay_max_age_hours") or 24))
+        try:
+            pending = pi.list_pending(max_age, path=pi.queue_path(cfg))
+        except Exception as exc:
+            return f"⚠️ Could not read the pending-intents ledger: {exc}"
+        if not show_all:
+            pending = [r for r in pending if str(r.get("chat_id")) == chat_id]
+        verdict = dm.assess(cfg)
+        status_line = (
+            f"Capable runtime: {verdict['detail']}"
+            if verdict["available"]
+            else f"No capable runtime — {verdict['detail']} (eta {verdict['eta'] or 'unknown'})"
+        )
+        if not pending:
+            scope = "any chat" if show_all else "this chat"
+            return f"No pending intents for {scope}.\n{status_line}"
+        lines = [f"{len(pending)} pending intent(s){' (all chats)' if show_all else ''}:"]
+        for rec in pending[:20]:
+            text = str(rec.get("text") or "").replace("\n", " ")
+            if len(text) > 80:
+                text = text[:77] + "..."
+            where = f"{rec.get('platform')}:{rec.get('chat_id')}" if show_all else ""
+            lines.append(
+                f"- {rec.get('created_at')} [{rec.get('reason')}] {where} {text}".replace("  ", " ")
+            )
+        if len(pending) > 20:
+            lines.append(f"... and {len(pending) - 20} more")
+        lines.append(status_line)
+        return "\n".join(lines)
+
     async def _handle_usage_command(self, event: MessageEvent) -> str:
         """Handle /usage command -- show token usage for the current session.
 

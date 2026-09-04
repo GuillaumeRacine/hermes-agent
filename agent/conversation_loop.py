@@ -614,6 +614,16 @@ def run_conversation(
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
 
+    # Degraded-mode flag hygiene: a cached agent that recovered its primary
+    # runtime between turns must not carry a stale sub-floor flag; one that is
+    # still parked on a sub-floor fallback keeps it (hermes-home #233 P0-1).
+    if getattr(agent, "_degraded_sub_floor", False):
+        try:
+            from agent.degraded_mode import refresh_agent_sub_floor_flag
+            refresh_agent_sub_floor_flag(agent)
+        except Exception:
+            logger.debug("degraded_mode flag refresh failed (fail-open)", exc_info=True)
+
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
     # all run inside Codex). Default Hermes path is bypassed entirely.
@@ -1026,10 +1036,19 @@ def run_conversation(
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
         api_kwargs = None  # Guard against UnboundLocalError in except handler
+        _degraded_stop = False  # Set when the fallback chain lands on a sub-floor runtime
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
 
         while retry_count < max_retries:
+            # ── Degraded-mode honesty gate (hermes-home #233 P0-1) ──
+            # ``_try_activate_fallback`` flags the agent when the chain
+            # landed on a sub-floor runtime. Do not ask that model for the
+            # answer: stop the turn and let the caller queue the request.
+            if getattr(agent, "_degraded_sub_floor", False):
+                _degraded_stop = True
+                break
+
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
             # limited, skip the API call entirely.  Each attempt
@@ -3782,6 +3801,34 @@ def run_conversation(
                             f"{int(sleep_end - time.time())}s remaining"
                         )
         
+        # Sub-floor runtime reached mid-turn: end the turn honestly with the
+        # fixed degraded-mode notice. The gateway records the user's message
+        # in the pending-intents ledger and replays it once a capable model
+        # is back (reason ``sub_floor_model``).
+        if _degraded_stop:
+            from agent.degraded_mode import SUB_FLOOR_EXIT_REASON, DEFAULT_NOTIFY_TEMPLATE
+            _turn_exit_reason = SUB_FLOOR_EXIT_REASON
+            # The iteration was consumed but no request was made.
+            api_call_count -= 1
+            agent._api_call_count = api_call_count
+            agent.iteration_budget.refund()
+            final_response = (
+                getattr(agent, "_degraded_notice", None)
+                or DEFAULT_NOTIFY_TEMPLATE.format(detail="fallback chain exhausted", eta="unknown")
+            )
+            logger.warning(
+                "Degraded mode: fallback landed on sub-floor runtime %s/%s — "
+                "ending turn with notice instead of answering (session=%s)",
+                agent.provider, agent.model, agent.session_id or "none",
+            )
+            agent._flush_status_buffer()
+            # Keep the transcript role-alternation valid: close a dangling
+            # tool tail, otherwise append the notice as the assistant turn.
+            if not close_interrupted_tool_sequence(messages, final_response):
+                messages.append({"role": "assistant", "content": final_response})
+            agent._persist_session(messages, conversation_history)
+            break
+
         # If the API call was interrupted, skip response processing
         if interrupted:
             _turn_exit_reason = "interrupted_during_api_call"

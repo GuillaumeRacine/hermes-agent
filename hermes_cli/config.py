@@ -950,6 +950,23 @@ DEFAULT_CONFIG = {
     "max_live_sessions": 16,
     "agent": {
         "max_turns": 90,
+        # Hard token budget enforced at runtime by the agent loop
+        # (agent/token_budget.py).  ``max_turns`` caps *iterations*; this
+        # caps *tokens* (prompt + completion, as billed by the provider).
+        # 0 = unlimited.  ``action``: "stop" ends the turn with a message
+        # once a limit is crossed; "warn" only logs/buffers a status line.
+        # ``context_soft_limit``: when a single request's prompt_tokens
+        # exceeds it, a context-compression pass is forced before the
+        # next API call.  ``platforms`` holds per-platform overrides keyed
+        # by agent platform name (cli, slack, telegram, cron, ...), e.g.
+        #   platforms: {slack: {per_session: 600000, per_turn: 150000}}
+        "token_budget": {
+            "per_session": 0,
+            "per_turn": 0,
+            "context_soft_limit": 0,
+            "action": "stop",
+            "platforms": {},
+        },
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
@@ -5804,6 +5821,69 @@ def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
     config["agent"] = agent_config
     config.pop("max_turns", None)
     return config
+
+
+TOKEN_BUDGET_ACTIONS = ("stop", "warn")
+TOKEN_BUDGET_LIMIT_KEYS = ("per_session", "per_turn", "context_soft_limit")
+
+
+def _coerce_token_limit(value: Any, default: int = 0) -> int:
+    """Coerce a token-budget limit to a non-negative int (0 = unlimited)."""
+    if value is None or value is False:
+        return default
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else 0
+
+
+def resolve_token_budget(
+    config: Optional[Dict[str, Any]],
+    platform: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return the effective ``agent.token_budget`` for ``platform``.
+
+    Merges ``DEFAULT_CONFIG["agent"]["token_budget"]`` <- the user's
+    ``agent.token_budget`` <- ``agent.token_budget.platforms[<platform>]``
+    (case-insensitive platform match).  Limits are coerced to non-negative
+    ints (0 = unlimited); ``action`` falls back to ``"stop"`` when it is
+    not one of :data:`TOKEN_BUDGET_ACTIONS`.
+
+    Returns a flat dict with keys ``per_session``, ``per_turn``,
+    ``context_soft_limit``, ``action`` and ``platform`` (the override key
+    that matched, or ``None``).
+    """
+    defaults = DEFAULT_CONFIG["agent"]["token_budget"]
+    agent_cfg = (config or {}).get("agent") if isinstance(config, dict) else None
+    raw = (agent_cfg or {}).get("token_budget") if isinstance(agent_cfg, dict) else None
+    if not isinstance(raw, dict):
+        raw = {}
+
+    resolved: Dict[str, Any] = {
+        key: _coerce_token_limit(raw.get(key), _coerce_token_limit(defaults.get(key)))
+        for key in TOKEN_BUDGET_LIMIT_KEYS
+    }
+    action = str(raw.get("action") or defaults.get("action") or "stop").strip().lower()
+    resolved["action"] = action if action in TOKEN_BUDGET_ACTIONS else "stop"
+    resolved["platform"] = None
+
+    platforms = raw.get("platforms")
+    if platform and isinstance(platforms, dict):
+        wanted = str(platform).strip().lower()
+        for name, override in platforms.items():
+            if str(name).strip().lower() != wanted or not isinstance(override, dict):
+                continue
+            for key in TOKEN_BUDGET_LIMIT_KEYS:
+                if key in override:
+                    resolved[key] = _coerce_token_limit(override.get(key), resolved[key])
+            if override.get("action") is not None:
+                p_action = str(override.get("action")).strip().lower()
+                if p_action in TOKEN_BUDGET_ACTIONS:
+                    resolved["action"] = p_action
+            resolved["platform"] = str(name)
+            break
+    return resolved
 
 
 def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> Any:

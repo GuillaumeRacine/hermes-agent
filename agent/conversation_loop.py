@@ -32,6 +32,7 @@ from agent.conversation_compression import conversation_history_after_compressio
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
+from agent.token_budget import TOKEN_BUDGET_EXCEEDED, is_continue_message
 from agent.turn_context import build_turn_context
 from agent.turn_retry_state import TurnRetryState
 from agent.memory_manager import build_memory_context_block
@@ -539,6 +540,31 @@ def run_conversation(
         except Exception:
             pass
 
+    # ── Token-budget one-more-turn override ──
+    # When the previous turn ended with ``token_budget_exceeded`` and the
+    # user replies with a bare ``continue``, raise the session limit by one
+    # turn's worth (per_turn, or 20% of per_session) so exactly one more
+    # turn may run.  Any other message while exceeded is refused at the top
+    # of the loop below without making an API call.
+    _token_budget = getattr(agent, "_token_budget", None)
+    if (
+        _token_budget is not None
+        and getattr(agent, "_token_budget_exceeded", False)
+        and is_continue_message(user_message)
+    ):
+        _granted = _token_budget.grant_extension()
+        agent._token_budget_exceeded = False
+        logger.info(
+            "Token budget: `continue` override granted +%s tokens "
+            "(session=%s, new per_session=%s)",
+            f"{_granted:,}", f"{_token_budget.session_tokens:,}",
+            f"{_token_budget.per_session:,}",
+        )
+        agent._buffer_status(
+            f"Token budget extended by {_granted:,} tokens for one more turn "
+            f"(session {_token_budget.session_tokens:,}/{_token_budget.per_session:,})."
+        )
+
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
     # message sanitization, todo/nudge hydration, system-prompt restore-or-
@@ -614,6 +640,28 @@ def run_conversation(
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break
         
+        # Token budget: a session that is already over its per_session
+        # limit (stop mode) refuses further API calls until the user sends
+        # ``continue`` (handled above) or starts a new session.
+        if (
+            _token_budget is not None
+            and _token_budget.stops
+            and _token_budget.session_exceeded()
+        ):
+            _token_budget.breach()
+            agent._token_budget_exceeded = True
+            _turn_exit_reason = TOKEN_BUDGET_EXCEEDED
+            final_response = _token_budget.stop_message()
+            messages.append({"role": "assistant", "content": final_response})
+            logger.warning(
+                "Token budget exceeded before API call #%d: %s",
+                api_call_count + 1, _token_budget.summary(),
+            )
+            agent._emit_status(f"⚠️ {final_response}")
+            if not agent.quiet_mode:
+                agent._safe_print(f"\n{final_response}\n")
+            break
+
         api_call_count += 1
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")
@@ -1890,6 +1938,13 @@ def run_conversation(
                     agent.session_completion_tokens += completion_tokens
                     agent.session_total_tokens += total_tokens
                     agent.session_api_calls += 1
+                    if _token_budget is not None:
+                        _token_budget.record(usage_dict)
+                        _tb_breach = _token_budget.breach()
+                        if _tb_breach and not _token_budget.stops and _token_budget.should_warn(_tb_breach):
+                            _tb_warn = _token_budget.warn_message(_tb_breach)
+                            logger.warning("Token budget (%s): %s", _tb_breach, _tb_warn)
+                            agent._buffer_status(f"⚠️ {_tb_warn}")
                     agent.session_input_tokens += canonical_usage.input_tokens
                     agent.session_output_tokens += canonical_usage.output_tokens
                     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
@@ -4279,6 +4334,33 @@ def run_conversation(
                 _tc_names = {tc.function.name for tc in assistant_message.tool_calls}
                 if _tc_names == {"execute_code"}:
                     agent.iteration_budget.refund()
+
+                # Token budget (stop mode): the tool results above keep the
+                # history valid; end the turn here instead of spending
+                # another API call.  Mirrors the guardrail-halt exit.
+                if _token_budget is not None and _token_budget.stops:
+                    _tb_breach = _token_budget.breach()
+                    if _tb_breach:
+                        if _tb_breach == "per_session":
+                            agent._token_budget_exceeded = True
+                        _turn_exit_reason = TOKEN_BUDGET_EXCEEDED
+                        final_response = _token_budget.stop_message()
+                        messages.append({"role": "assistant", "content": final_response})
+                        logger.warning(
+                            "Token budget exceeded (%s) after API call #%d: %s",
+                            _tb_breach, api_call_count, _token_budget.summary(),
+                        )
+                        agent._emit_status(f"⚠️ {final_response}")
+                        if not agent.quiet_mode:
+                            agent._safe_print(f"\n{final_response}\n")
+                        if agent.stream_delta_callback:
+                            try:
+                                agent.stream_delta_callback(final_response)
+                                agent.stream_delta_callback(None)
+                            except Exception:
+                                pass
+                        agent._session_messages = messages
+                        break
                 
                 # Use real token counts from the API response to decide
                 # compression.  prompt_tokens + completion_tokens is the
@@ -4316,8 +4398,34 @@ def run_conversation(
                         messages, tools=agent.tools or None
                     )
 
-                if agent.compression_enabled and _compressor.should_compress(_real_tokens):
+                # Token budget ``context_soft_limit``: the last request's
+                # prompt_tokens crossed the soft limit, so force a compression
+                # pass through the same path the threshold check uses.
+                _soft_limit_compress = (
+                    _token_budget is not None
+                    and _token_budget.consume_compression_request()
+                )
+                if _soft_limit_compress and not agent.compression_enabled:
+                    if _token_budget.should_warn_soft_limit_unavailable():
+                        logger.warning(
+                            "context soft limit exceeded and compression unavailable "
+                            "(compression disabled): prompt_tokens=%s > %s",
+                            f"{_token_budget.last_prompt_tokens:,}",
+                            f"{_token_budget.context_soft_limit:,}",
+                        )
+
+                if agent.compression_enabled and (
+                    _compressor.should_compress(_real_tokens) or _soft_limit_compress
+                ):
+                    if _soft_limit_compress:
+                        logger.info(
+                            "Token budget: context soft limit exceeded "
+                            "(prompt_tokens=%s > %s) — forcing compression",
+                            f"{_token_budget.last_prompt_tokens:,}",
+                            f"{_token_budget.context_soft_limit:,}",
+                        )
                     agent._safe_print("  ⟳ compacting context…")
+                    _pre_compress_len = len(messages)
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
                         approx_tokens=agent.context_compressor.last_prompt_tokens,
@@ -4326,6 +4434,17 @@ def run_conversation(
                     conversation_history = conversation_history_after_compression(
                         agent, messages
                     )
+                    if (
+                        _soft_limit_compress
+                        and len(messages) >= _pre_compress_len
+                        and _token_budget.should_warn_soft_limit_unavailable()
+                    ):
+                        logger.warning(
+                            "context soft limit exceeded and compression unavailable "
+                            "(compression pass made no progress): prompt_tokens=%s > %s",
+                            f"{_token_budget.last_prompt_tokens:,}",
+                            f"{_token_budget.context_soft_limit:,}",
+                        )
                 
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages

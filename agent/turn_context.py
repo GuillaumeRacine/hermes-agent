@@ -246,6 +246,9 @@ def build_turn_context(
 
     # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
     agent.iteration_budget = IterationBudget(agent.max_iterations)
+    _token_budget = getattr(agent, "_token_budget", None)
+    if _token_budget is not None:
+        _token_budget.reset_turn()
 
     # Log conversation turn start for debugging/observability.
     _preview_text = summarize_user_message_for_log(user_message)

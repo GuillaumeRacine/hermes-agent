@@ -658,6 +658,12 @@ class AIAgent:
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
 
+        # Token budget counters follow the session (limits are kept).
+        _token_budget = getattr(self, "_token_budget", None)
+        if _token_budget is not None:
+            _token_budget.reset_session()
+        self._token_budget_exceeded = False
+
         # Context engine reset/transition (works for built-in compressor and plugins)
         self._transition_context_engine_session(
             old_session_id=old_session_id,
@@ -2781,6 +2787,13 @@ class AIAgent:
                 prefix
                 + "the per-turn iteration/cost budget was exhausted before a "
                 "final answer. Send `continue` to keep going."
+            )
+        if reason == "token_budget_exceeded":
+            return (
+                prefix
+                + "the session's token budget (agent.token_budget) was "
+                "exceeded. Send `continue` to allow one more turn, raise the "
+                "budget, or start a new session."
             )
         if reason == "ollama_runtime_context_too_small":
             return (

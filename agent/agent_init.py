@@ -1710,6 +1710,17 @@ def init_agent(
     agent.session_prompt_tokens = 0
     agent.session_completion_tokens = 0
     agent.session_total_tokens = 0
+    # Hard per-session / per-turn token budget (agent.token_budget in
+    # config.yaml, per-platform overrides resolved for ``agent.platform``).
+    # Enforced in the conversation loop; see agent/token_budget.py.
+    try:
+        from agent.token_budget import TokenBudget as _TokenBudget
+        agent._token_budget = _TokenBudget.from_config(_agent_cfg, agent.platform)
+    except Exception as _tb_err:
+        _ra().logger.warning("Token budget config ignored: %s", _tb_err)
+        from agent.token_budget import TokenBudget as _TokenBudget
+        agent._token_budget = _TokenBudget()
+    agent._token_budget_exceeded = False
     agent.session_api_calls = 0
     agent.session_input_tokens = 0
     agent.session_output_tokens = 0

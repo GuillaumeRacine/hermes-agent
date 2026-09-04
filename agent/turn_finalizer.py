@@ -213,13 +213,16 @@ def finalize_turn(
     _budget_used = agent.iteration_budget.used if agent.iteration_budget else 0
     _budget_max = agent.iteration_budget.max_total if agent.iteration_budget else 0
 
+    _token_budget = getattr(agent, "_token_budget", None)
+    _tokens_summary = _token_budget.summary() if _token_budget is not None else "n/a"
+
     _diag_msg = (
-        "Turn ended: reason=%s model=%s api_calls=%d/%d budget=%d/%d "
+        "Turn ended: reason=%s model=%s api_calls=%d/%d budget=%d/%d tokens=%s "
         "tool_turns=%d last_msg_role=%s response_len=%d session=%s"
     )
     _diag_args = (
         _turn_exit_reason, agent.model, api_call_count, agent.max_iterations,
-        _budget_used, _budget_max,
+        _budget_used, _budget_max, _tokens_summary,
         _turn_tool_count, _last_msg_role, _resp_len,
         agent.session_id or "none",
     )

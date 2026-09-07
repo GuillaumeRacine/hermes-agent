@@ -1649,6 +1649,116 @@ class TestRunJobSessionPersistence:
         assert "final fallback report" in output
         assert "(FAILED)" not in output
 
+    def test_run_job_treats_token_budget_exceeded_as_failure(self, tmp_path):
+        """Issue #58: a cron turn that hits token_budget_exceeded still returns
+        completed=True plus the raw stop notice. That must not be success.
+        """
+        stop_notice = (
+            "Stopped: this session has used 688,813 tokens of its 600,000 budget "
+            "(turn: 12,345/unlimited). Reply `continue` to allow one more turn, "
+            "or start a new session."
+        )
+        job = {
+            "id": "budget-job",
+            "name": "Weekly Messaging Curation",
+            "prompt": "curate last week's posts",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": stop_notice,
+                "completed": True,
+                "failed": False,
+                "turn_exit_reason": "token_budget_exceeded",
+            }
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert error is not None
+        assert "token budget" in error.lower()
+        assert "Reply `continue`" not in error
+        assert stop_notice not in output
+        assert "(FAILED)" in output
+        mock_agent.close.assert_called_once()
+
+    def test_run_one_job_token_budget_exceeded_uses_error_target(self, tmp_path):
+        """Issue #58: token-budget exhaustion must mark last_status as failure
+        and deliver one summarized ops notice, not the raw stop text.
+        """
+        from cron.scheduler import run_one_job
+
+        stop_notice = (
+            "Stopped: this session has used 688,813 tokens of its 600,000 budget "
+            "(turn: 12,345/unlimited). Reply `continue` to allow one more turn, "
+            "or start a new session."
+        )
+        job = {
+            "id": "budget-job",
+            "name": "Weekly Messaging Curation",
+            "prompt": "curate last week's posts",
+            "deliver": "slack:content-channel",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls, \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock, \
+             patch.dict(os.environ, {"HERMES_CRON_FAILURE_DELIVER": "slack:systems-channel"}):
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": stop_notice,
+                "completed": True,
+                "failed": False,
+                "turn_exit_reason": "token_budget_exceeded",
+            }
+            mock_agent_cls.return_value = mock_agent
+            run_one_job(job)
+
+        mark_mock.assert_called_once()
+        assert mark_mock.call_args[0][0] == "budget-job"
+        assert mark_mock.call_args[0][1] is False
+        deliver_mock.assert_called_once()
+        delivered_job, delivered_content = deliver_mock.call_args.args[:2]
+        assert delivered_job["deliver"] == "slack:systems-channel"
+        assert delivered_job["origin"] is None
+        assert job["deliver"] == "slack:content-channel"
+        assert stop_notice not in delivered_content
+        assert "Reply `continue`" not in delivered_content
+        assert "token budget" in delivered_content.lower()
+        assert "Weekly Messaging Curation" in delivered_content
+
     def test_tick_marks_empty_response_as_error(self, tmp_path):
         """When run_job returns success=True but final_response is empty,
         tick() should mark the job as error so last_status != 'ok'.

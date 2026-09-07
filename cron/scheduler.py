@@ -2982,6 +2982,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # builds the proper failure tuple. (issue #17855)
         turn_exit_reason = str(result.get("turn_exit_reason") or "")
         final_response_text = (result.get("final_response") or "").strip()
+        if turn_exit_reason == "token_budget_exceeded":
+            raise RuntimeError(
+                "agent stopped after reaching its token budget; "
+                "no useful final result was produced"
+            )
         max_iteration_summary = (
             result.get("failed") is not True
             and result.get("completed") is False

@@ -555,3 +555,32 @@ class TestReasoningStyle:
 
         config = {"display": {"reasoning_style": "SUBTEXT"}}
         assert resolve_display_setting(config, "telegram", "reasoning_style") == "subtext"
+
+
+class TestFinalOnly:
+    def test_requires_explicit_per_platform_opt_in(self):
+        from gateway.display_config import resolve_final_only
+
+        global_only = {"display": {"final_only": True}}
+        assert resolve_final_only(global_only, "slack") is False
+
+        slack_only = {
+            "display": {"platforms": {"slack": {"final_only": True}}}
+        }
+        assert resolve_final_only(slack_only, "slack") is True
+        assert resolve_final_only(slack_only, "telegram") is False
+
+    def test_cli_and_tui_cannot_enable_final_only(self):
+        from gateway.display_config import resolve_final_only
+
+        config = {
+            "display": {
+                "platforms": {
+                    "local": {"final_only": True},
+                    "cli": {"final_only": True},
+                    "tui": {"final_only": True},
+                }
+            }
+        }
+        for platform in ("local", "cli", "tui"):
+            assert resolve_final_only(config, platform) is False

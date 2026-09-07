@@ -395,7 +395,17 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
-def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
+_FINAL_ONLY_EVIDENCE_LINE_RE = re.compile(
+    r"(?im)^[ \t]*(?:gate|trace):[^\n]*(?:\n|$)"
+)
+
+
+def _sanitize_gateway_final_response(
+    platform: Any,
+    text: str,
+    *,
+    final_only: bool = False,
+) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
     Every human-facing chat surface (Telegram, WhatsApp, Discord, Slack,
@@ -413,6 +423,9 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     redacted = _redact_gateway_user_facing_secrets(str(text))
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)
+    if final_only:
+        redacted = _FINAL_ONLY_EVIDENCE_LINE_RE.sub("", redacted)
+        redacted = re.sub(r"\n{3,}", "\n\n", redacted).strip()
     return redacted
 
 
@@ -1837,12 +1850,6 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"),
-        "circuit_provider": runtime.get("circuit_provider")
-        or (
-            runtime.get("requested_provider")
-            if runtime.get("provider") == "custom"
-            else runtime.get("provider")
-        ),
         "api_mode": runtime.get("api_mode"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
@@ -3534,16 +3541,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(
-        self,
-        user_message: str,
-        model: str,
-        runtime_kwargs: dict,
-        *,
-        allow_guarded_activation: bool = False,
-        pin_key: str | None = None,
-        uninspected_attachments: bool = False,
-    ) -> dict:
+    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         """Build the effective model/runtime config for a single turn.
 
         Always uses the session's primary model/provider.  If `/fast` is
@@ -3562,7 +3560,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
             "max_tokens": runtime_kwargs.get("max_tokens"),
-            "circuit_provider": runtime_kwargs.get("circuit_provider"),
         }
         route = {
             "model": model,
@@ -3577,50 +3574,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ),
         }
         try:
-            from hermes_cli.adaptive_routing import (
-                apply_guarded_route,
-                get_route_pin,
-                observe_shadow_route,
-            )
+            from hermes_cli.adaptive_routing import observe_shadow_route
             from hermes_cli.config import load_config
 
-            _routing_config = load_config()
             route["adaptive_routing"] = observe_shadow_route(
                 user_message,
                 model,
                 str(runtime["provider"] or ""),
-                _routing_config,
-                assume_private=uninspected_attachments,
+                load_config(),
             )
-            _existing_pin = (
-                get_route_pin(pin_key, _routing_config)
-                if pin_key
-                else None
-            )
-            if allow_guarded_activation or _existing_pin:
-                route = apply_guarded_route(
-                    route,
-                    route["adaptive_routing"],
-                    _routing_config,
-                    pin_key=pin_key,
-                )
         except Exception:
             logger.debug(
                 "Adaptive route observation failed",
                 exc_info=True,
             )
-            route["adaptive_routing"] = (
-                {
-                    "mode": "guarded",
-                    "active": None,
-                    "activation_blockers": [
-                        "adaptive routing preflight failed"
-                    ],
-                    "block_execution": True,
-                }
-                if allow_guarded_activation
-                else None
-            )
+            route["adaptive_routing"] = None
 
         service_tier = getattr(self, "_service_tier", None)
         if not service_tier:
@@ -10303,6 +10271,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             response = agent_result.get("final_response") or ""
             try:
+                from gateway.display_config import resolve_final_only
+                _final_only = resolve_final_only(
+                    _load_gateway_config(),
+                    _platform_config_key(source.platform),
+                )
+            except Exception:
+                _final_only = False
+            try:
                 from gateway.response_filters import is_intentional_silence_agent_result
                 _intentional_silence = is_intentional_silence_agent_result(
                     agent_result, response,
@@ -10369,7 +10345,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response = _normalize_empty_agent_response(
                     agent_result, response, history_len=len(history),
                 )
-                response = _sanitize_gateway_final_response(source.platform, response)
+                response = _sanitize_gateway_final_response(
+                    source.platform,
+                    response,
+                    final_only=_final_only,
+                )
 
             # Ordering contract: the agent thread already updated the contextvar
             # in conversation_compression.py; propagate to SessionEntry + _save().
@@ -10383,21 +10363,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
             # Prepend reasoning/thinking if display is enabled (per-platform).
-            # Mattermost requires explicit per-platform opt-in because this is
-            # scratch text, not ordinary final-answer content.
+            # Final-only platforms suppress scratch text even when a global
+            # show_reasoning setting is enabled.
             try:
-                _show_reasoning_effective = _resolve_gateway_display_bool(
-                    _load_gateway_config(),
-                    _platform_config_key(source.platform),
-                    "show_reasoning",
-                    default=bool(getattr(self, "_show_reasoning", False)),
-                    platform=source.platform,
-                    require_platform_override_for={Platform.MATTERMOST},
+                _show_reasoning_effective = (
+                    False
+                    if _final_only
+                    else _resolve_gateway_display_bool(
+                        _load_gateway_config(),
+                        _platform_config_key(source.platform),
+                        "show_reasoning",
+                        default=bool(getattr(self, "_show_reasoning", False)),
+                        platform=source.platform,
+                        require_platform_override_for={Platform.MATTERMOST},
+                    )
                 )
             except Exception:
                 _show_reasoning_effective = (
                     False
-                    if source.platform == Platform.MATTERMOST
+                    if _final_only or source.platform == Platform.MATTERMOST
                     else getattr(self, "_show_reasoning", False)
                 )
             if _show_reasoning_effective and response and not _intentional_silence:
@@ -11928,36 +11912,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reasoning_config = self._resolve_session_reasoning_config(source=source)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
-            _route_started_monotonic = time.monotonic()
-            turn_route = self._resolve_turn_agent_config(
-                prompt,
-                model,
-                runtime_kwargs,
-                allow_guarded_activation=True,
-                pin_key=task_id,
-                uninspected_attachments=bool(media_urls),
-            )
-            _route_decision = turn_route.get("adaptive_routing") or {}
-            if _route_decision.get("block_execution"):
-                await adapter.send(
-                    source.chat_id,
-                    (
-                        f"⛔ Background task {task_id} was blocked by the "
-                        "model-routing safety gate. No model request was sent."
-                    ),
-                    metadata=_thread_metadata,
-                )
-                return
-
-            task_fallback_model = self._fallback_model
-            from hermes_cli.adaptive_routing import (
-                filter_fallbacks_for_decision,
-            )
-
-            task_fallback_model = filter_fallbacks_for_decision(
-                task_fallback_model,
-                _route_decision,
-            )
+            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
 
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).
@@ -11977,15 +11932,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.warning("Background task vision enrichment failed: %s", e)
 
             def run_sync():
-                agent_runtime = dict(turn_route["runtime"])
-                circuit_provider = str(
-                    agent_runtime.pop("circuit_provider", "")
-                    or agent_runtime.get("provider")
-                    or ""
-                )
                 agent = AIAgent(
                     model=turn_route["model"],
-                    **agent_runtime,
+                    **turn_route["runtime"],
                     max_iterations=max_iterations,
                     quiet_mode=True,
                     verbose_logging=False,
@@ -12010,44 +11959,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     session_db=self._session_db,
-                    fallback_model=task_fallback_model,
+                    fallback_model=self._fallback_model,
                 )
-                agent._circuit_provider = circuit_provider
-                if isinstance(getattr(agent, "_primary_runtime", None), dict):
-                    agent._primary_runtime["circuit_provider"] = circuit_provider
                 try:
-                    try:
-                        from hermes_cli.adaptive_routing import (
-                            capture_route_usage,
-                        )
-
-                        _route_usage_before = capture_route_usage(agent)
-                    except Exception:
-                        _route_usage_before = {}
-                    result = agent.run_conversation(
+                    return agent.run_conversation(
                         user_message=enriched_prompt,
                         task_id=task_id,
                     )
-                    try:
-                        from hermes_cli.adaptive_routing import (
-                            record_route_outcome,
-                        )
-
-                        record_route_outcome(
-                            turn_route.get("adaptive_routing"),
-                            result,
-                            agent,
-                            user_config,
-                            usage_before=_route_usage_before,
-                            started_monotonic=_route_started_monotonic,
-                            surface="gateway_background",
-                        )
-                    except Exception:
-                        logger.debug(
-                            "Adaptive route outcome recording failed",
-                            exc_info=True,
-                        )
-                    return result
                 finally:
                     self._cleanup_agent_resources(agent)
 
@@ -15310,7 +15228,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Per-platform display settings — resolve via display_config module
         # which checks display.platforms.<platform>.<key> first, then
         # display.<key> global, then built-in platform defaults.
-        from gateway.display_config import resolve_display_setting
+        from gateway.display_config import resolve_display_setting, resolve_final_only
+
+        final_only = resolve_final_only(user_config, platform_key)
 
         # Apply tool preview length config (0 = no limit)
         try:
@@ -15348,12 +15268,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
-        tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        tool_progress_enabled = (
+            not final_only
+            and progress_mode != "off"
+            and source.platform != Platform.WEBHOOK
+        )
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
         interim_assistant_messages_enabled = (
-            source.platform != Platform.WEBHOOK
+            not final_only
+            and source.platform != Platform.WEBHOOK
             and _resolve_gateway_display_bool(
                 user_config,
                 platform_key,
@@ -15367,7 +15292,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # queue even when tool_progress is off (thinking relay uses same infra).
         # Mattermost requires a per-platform opt-in: global scratch-text display
         # is too easy to leak into busy public threads.
-        _thinking_enabled = _resolve_gateway_display_bool(
+        _thinking_enabled = not final_only and _resolve_gateway_display_bool(
             user_config,
             platform_key,
             "thinking_progress",
@@ -16170,7 +16095,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_config, platform_key, "streaming"
             )
             # None = no per-platform override → follow global config
-            _streaming_enabled = (
+            _streaming_enabled = not final_only and (
                 _scfg.enabled and _scfg.transport != "off"
                 if _plat_streaming is None
                 else bool(_plat_streaming)
@@ -16267,12 +16192,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_message="interim_assistant_callback scheduling error",
                 )
 
-            _route_started_monotonic = time.monotonic()
-            turn_route = self._resolve_turn_agent_config(
-                message,
-                model,
-                runtime_kwargs,
-            )
+            turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -16382,15 +16302,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if agent is None:
                 # Config changed or first message — create fresh agent
-                agent_runtime = dict(turn_route["runtime"])
-                circuit_provider = str(
-                    agent_runtime.pop("circuit_provider", "")
-                    or agent_runtime.get("provider")
-                    or ""
-                )
                 agent = AIAgent(
                     model=turn_route["model"],
-                    **agent_runtime,
+                    **turn_route["runtime"],
                     max_iterations=max_iterations,
                     quiet_mode=True,
                     verbose_logging=False,
@@ -16420,9 +16334,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
-                agent._circuit_provider = circuit_provider
-                if isinstance(getattr(agent, "_primary_runtime", None), dict):
-                    agent._primary_runtime["circuit_provider"] = circuit_provider
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
                         _cache[session_key] = (agent, _sig, _current_msg_count)
@@ -16440,7 +16351,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
-            agent.status_callback = _status_callback_sync
+            agent.status_callback = None if final_only else _status_callback_sync
             # Credits / out-of-band notices (usage bands, depletion, restored).
             # Messaging has no persistent status bar, so each notice is a
             # standalone push: render to a single plaintext line and deliver via
@@ -16470,7 +16381,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_message="notice_callback delivery scheduling error",
                 )
 
-            agent.notice_callback = _notice_callback_sync
+            agent.notice_callback = None if final_only else _notice_callback_sync
             agent.notice_clear_callback = None
             agent.event_callback = _event_callback_sync
             agent.reasoning_config = reasoning_config
@@ -16514,7 +16425,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             return
                 _deliver_bg_review_message(message)
 
-            agent.background_review_callback = _bg_review_send
+            agent.background_review_callback = None if final_only else _bg_review_send
             # Register the release hook on the adapter so base.py's finally
             # block can fire it after delivering the main response.
             if _status_adapter and session_key:
@@ -16927,33 +16838,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-                try:
-                    from hermes_cli.adaptive_routing import capture_route_usage
-
-                    _route_usage_before = capture_route_usage(agent)
-                except Exception:
-                    _route_usage_before = {}
-                result = agent.run_conversation(
-                    _api_run_message,
-                    **_conversation_kwargs,
-                )
-                try:
-                    from hermes_cli.adaptive_routing import record_route_outcome
-
-                    record_route_outcome(
-                        turn_route.get("adaptive_routing"),
-                        result,
-                        agent,
-                        user_config,
-                        usage_before=_route_usage_before,
-                        started_monotonic=_route_started_monotonic,
-                        surface="gateway",
-                    )
-                except Exception:
-                    logger.debug(
-                        "Adaptive route outcome recording failed",
-                        exc_info=True,
-                    )
+                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
@@ -17329,7 +17214,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # 0 = disable notifications.
         _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
-        if not bool(
+        if final_only or not bool(
             resolve_display_setting(
                 user_config,
                 platform_key,

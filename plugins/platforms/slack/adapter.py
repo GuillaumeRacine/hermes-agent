@@ -593,7 +593,14 @@ class SlackAdapter(BasePlatformAdapter):
             return None
 
     async def _restart_socket_mode(self, reason: str) -> None:
-        """Reconnect Socket Mode without rebuilding adapter state."""
+        """Escalate a dead Socket Mode transport for full adapter rebuild.
+
+        ``SocketModeClient.close()`` permanently closes its aiohttp session.
+        Replacing only ``AsyncSocketModeHandler`` after that close can leave the
+        Slack SDK retrying a closed connector forever.  The gateway reconnect
+        path constructs a fresh adapter, AsyncApp, handler, and client session,
+        so hand retryable transport failures to that path instead.
+        """
         if not self._running:
             return
 
@@ -601,15 +608,18 @@ class SlackAdapter(BasePlatformAdapter):
             if not self._running or not self._app or not self._app_token:
                 return
 
-            logger.warning("[Slack] Socket Mode unhealthy (%s); reconnecting", reason)
-            await self._stop_socket_mode_handler()
-
-            try:
-                self._start_socket_mode_handler()
-            except Exception as exc:  # pragma: no cover - defensive logging
-                logger.error(
-                    "[Slack] Socket Mode reconnect failed: %s", exc, exc_info=True
-                )
+            logger.warning(
+                "[Slack] Socket Mode unhealthy (%s); rebuilding adapter", reason
+            )
+            self._set_fatal_error(
+                "socket_transport_closed",
+                f"Slack Socket Mode transport is unavailable ({reason})",
+                retryable=True,
+            )
+            if self._fatal_error_handler is not None:
+                await self._notify_fatal_error()
+            else:  # pragma: no cover - standalone defensive cleanup
+                await self._stop_socket_mode_handler()
 
     async def _socket_watchdog_loop(self) -> None:
         """Monitor Socket Mode and reconnect if the task/transport dies.
@@ -1276,7 +1286,12 @@ class SlackAdapter(BasePlatformAdapter):
 
         watchdog_task = self._socket_watchdog_task
         self._socket_watchdog_task = None
-        if watchdog_task is not None and not watchdog_task.done():
+        current_task = asyncio.current_task()
+        if (
+            watchdog_task is not None
+            and watchdog_task is not current_task
+            and not watchdog_task.done()
+        ):
             watchdog_task.cancel()
             try:
                 await watchdog_task

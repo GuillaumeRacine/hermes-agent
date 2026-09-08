@@ -552,10 +552,12 @@ class TestSlackSocketWatchdog:
             await asyncio.sleep(0)
 
     @pytest.mark.asyncio
-    async def test_watchdog_reconnects_when_socket_task_dies_unexpectedly(self):
+    async def test_watchdog_escalates_when_socket_task_dies_unexpectedly(self):
         adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
         adapter._socket_watchdog_interval_s = 0.01
         factory, instances = self._make_fake_handler_factory()
+        fatal_handler = AsyncMock()
+        adapter.set_fatal_error_handler(fatal_handler)
 
         with contextlib.ExitStack() as stack:
             for p in self._patch_stack(factory):
@@ -569,22 +571,28 @@ class TestSlackSocketWatchdog:
                 await self._drain()
 
                 for _ in range(40):
-                    if len(instances) >= 2:
+                    if fatal_handler.await_count:
                         break
                     await asyncio.sleep(0.01)
 
-                assert len(instances) >= 2, "watchdog/done_callback did not reconnect"
-                assert instances[0].closed is True
-                assert instances[-1].start_calls == 1
-                assert adapter._handler is instances[-1]
+                fatal_handler.assert_awaited_once_with(adapter)
+                assert adapter.fatal_error_retryable is True
+                assert adapter.fatal_error_code == "socket_transport_closed"
+                assert len(instances) == 1, "closed SDK session was reused in place"
             finally:
                 await adapter.disconnect()
 
     @pytest.mark.asyncio
-    async def test_watchdog_reconnects_when_transport_reports_disconnected(self):
+    async def test_watchdog_transport_loss_allows_gateway_disconnect_from_watchdog(self):
         adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
         adapter._socket_watchdog_interval_s = 0.01
         factory, instances = self._make_fake_handler_factory()
+
+        async def gateway_failure_handler(subject):
+            await subject.disconnect()
+
+        fatal_handler = AsyncMock(side_effect=gateway_failure_handler)
+        adapter.set_fatal_error_handler(fatal_handler)
 
         with contextlib.ExitStack() as stack:
             for p in self._patch_stack(factory):
@@ -597,13 +605,14 @@ class TestSlackSocketWatchdog:
                 instances[0].client.is_connected = lambda: False
 
                 for _ in range(40):
-                    if len(instances) >= 2:
+                    if fatal_handler.await_count and not adapter._running:
                         break
                     await asyncio.sleep(0.01)
 
-                assert len(instances) >= 2, "watchdog did not heal dead transport"
+                fatal_handler.assert_awaited_once_with(adapter)
                 assert instances[0].closed is True
-                assert adapter._handler is instances[-1]
+                assert adapter._socket_watchdog_task is None
+                assert len(instances) == 1
             finally:
                 await adapter.disconnect()
 
@@ -759,10 +768,12 @@ class TestSlackSocketWatchdog:
                 await adapter.disconnect()
 
     @pytest.mark.asyncio
-    async def test_reconnect_lock_prevents_concurrent_reconnects(self):
+    async def test_reconnect_lock_prevents_duplicate_fatal_escalation(self):
         adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
         adapter._socket_watchdog_interval_s = 9999
         factory, instances = self._make_fake_handler_factory()
+        fatal_handler = AsyncMock()
+        adapter.set_fatal_error_handler(fatal_handler)
 
         with contextlib.ExitStack() as stack:
             for p in self._patch_stack(factory):
@@ -777,11 +788,8 @@ class TestSlackSocketWatchdog:
                     adapter._restart_socket_mode("done-callback"),
                 )
 
-                new_handlers = len(instances) - baseline
-                assert new_handlers >= 1
-                assert (
-                    new_handlers <= 2
-                ), f"reconnect lock failed: {new_handlers} new handlers"
+                assert len(instances) == baseline
+                fatal_handler.assert_awaited_once_with(adapter)
             finally:
                 await adapter.disconnect()
 

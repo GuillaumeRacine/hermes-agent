@@ -18,6 +18,7 @@ def test_defaults_are_unlimited_and_stop():
         "per_turn": 0,
         "context_soft_limit": 0,
         "action": "stop",
+        "cache_read_weight": 0.1,
         "platforms": {},
     }
     resolved = resolve_token_budget({}, "cli")
@@ -26,6 +27,7 @@ def test_defaults_are_unlimited_and_stop():
         "per_turn": 0,
         "context_soft_limit": 0,
         "action": "stop",
+        "cache_read_weight": 0.1,
         "platform": None,
     }
     assert resolve_token_budget(None, None)["action"] == "stop"

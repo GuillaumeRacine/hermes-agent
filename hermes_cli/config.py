@@ -965,6 +965,12 @@ DEFAULT_CONFIG = {
             "per_turn": 0,
             "context_soft_limit": 0,
             "action": "stop",
+            # Weight applied to cache-read tokens when charging the budget.
+            # Providers report them inside total_tokens at full price, but
+            # they cost ~10% of a fresh input token; counting them raw makes
+            # the budget measure re-sent prompt volume, not spend
+            # (hermes-agent#62).  1.0 restores the pre-fix behaviour.
+            "cache_read_weight": 0.1,
             "platforms": {},
         },
         # Inactivity timeout for gateway agent execution (seconds).
@@ -5825,6 +5831,25 @@ def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
 TOKEN_BUDGET_ACTIONS = ("stop", "warn")
 TOKEN_BUDGET_LIMIT_KEYS = ("per_session", "per_turn", "context_soft_limit")
+TOKEN_BUDGET_DEFAULT_CACHE_READ_WEIGHT = 0.1
+
+
+def _coerce_cache_read_weight(value: Any, default: float) -> float:
+    """Coerce the cache-read weight to a float in [0.0, 1.0].
+
+    Unlike the token limits this is a ratio, so 0 is meaningful (ignore
+    cache reads entirely) rather than "unlimited" -- it cannot share
+    :func:`_coerce_token_limit`, which maps 0 to the disabled sentinel.
+    """
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed != parsed:  # NaN
+        return default
+    return min(1.0, max(0.0, parsed))
 
 
 def _coerce_token_limit(value: Any, default: int = 0) -> int:
@@ -5866,6 +5891,13 @@ def resolve_token_budget(
     }
     action = str(raw.get("action") or defaults.get("action") or "stop").strip().lower()
     resolved["action"] = action if action in TOKEN_BUDGET_ACTIONS else "stop"
+    resolved["cache_read_weight"] = _coerce_cache_read_weight(
+        raw.get("cache_read_weight"),
+        _coerce_cache_read_weight(
+            defaults.get("cache_read_weight"),
+            TOKEN_BUDGET_DEFAULT_CACHE_READ_WEIGHT,
+        ),
+    )
     resolved["platform"] = None
 
     platforms = raw.get("platforms")
@@ -5881,6 +5913,10 @@ def resolve_token_budget(
                 p_action = str(override.get("action")).strip().lower()
                 if p_action in TOKEN_BUDGET_ACTIONS:
                     resolved["action"] = p_action
+            if override.get("cache_read_weight") is not None:
+                resolved["cache_read_weight"] = _coerce_cache_read_weight(
+                    override.get("cache_read_weight"), resolved["cache_read_weight"]
+                )
             resolved["platform"] = str(name)
             break
     return resolved

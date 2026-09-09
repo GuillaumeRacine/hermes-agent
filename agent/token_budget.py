@@ -33,6 +33,25 @@ from typing import Any, Dict, Optional
 
 TOKEN_BUDGET_EXCEEDED = "token_budget_exceeded"
 
+# Cache reads are re-sent prompt prefix served from the provider's cache.  They
+# are billed at roughly a tenth of a fresh input token, but providers report
+# them inside ``total_tokens`` at full weight.  Counting them raw makes the
+# budget measure prompt volume re-sent rather than spend: a 73k-context turn
+# doing 20 tool round-trips books ~1.5M "tokens" while costing ~200k.  See
+# hermes-agent#62 -- 55 of 56 observed per_turn stops were false positives.
+DEFAULT_CACHE_READ_WEIGHT = 0.1
+
+
+def _usage_has(usage: Any, name: str) -> bool:
+    """True when ``usage`` exposes ``name`` with a non-None value.
+
+    Used to tell the OpenAI (``prompt_tokens``, cache-inclusive) convention
+    apart from the Anthropic (``input_tokens``, cache-exclusive) one.
+    """
+    if isinstance(usage, dict):
+        return usage.get(name) is not None
+    return getattr(usage, name, None) is not None
+
 
 def _usage_int(usage: Any, *names: str) -> int:
     """Read the first present integer-ish field from a usage dict/object."""
@@ -66,15 +85,27 @@ class TokenBudget:
         context_soft_limit: int = 0,
         action: str = "stop",
         platform: Optional[str] = None,
+        cache_read_weight: float = DEFAULT_CACHE_READ_WEIGHT,
     ):
         self.per_session = max(0, int(per_session or 0))
         self.per_turn = max(0, int(per_turn or 0))
         self.context_soft_limit = max(0, int(context_soft_limit or 0))
         self.action = "warn" if str(action or "stop").lower() == "warn" else "stop"
         self.platform = platform
+        try:
+            weight = float(cache_read_weight)
+        except (TypeError, ValueError):
+            weight = DEFAULT_CACHE_READ_WEIGHT
+        # Clamp to [0, 1]: 0 ignores cache reads entirely, 1 restores the old
+        # raw-total behaviour.
+        self.cache_read_weight = min(1.0, max(0.0, weight))
 
         self.session_tokens = 0
         self.turn_tokens = 0
+        # Raw provider totals, kept only for display (`hermes --resume`, the
+        # stop message).  Limits are never checked against these.
+        self.session_raw_tokens = 0
+        self.turn_raw_tokens = 0
         self.last_prompt_tokens = 0
         self.api_calls = 0
         self.extensions_granted = 0
@@ -108,6 +139,9 @@ class TokenBudget:
             context_soft_limit=resolved["context_soft_limit"],
             action=resolved["action"],
             platform=resolved.get("platform") or platform,
+            cache_read_weight=resolved.get(
+                "cache_read_weight", DEFAULT_CACHE_READ_WEIGHT
+            ),
         )
 
     @classmethod
@@ -118,6 +152,9 @@ class TokenBudget:
             context_soft_limit=resolved.get("context_soft_limit", 0),
             action=resolved.get("action", "stop"),
             platform=resolved.get("platform"),
+            cache_read_weight=resolved.get(
+                "cache_read_weight", DEFAULT_CACHE_READ_WEIGHT
+            ),
         )
 
     # ── properties ─────────────────────────────────────────────────
@@ -137,6 +174,7 @@ class TokenBudget:
         """Start a new user turn (session counters are kept)."""
         with self._lock:
             self.turn_tokens = 0
+            self.turn_raw_tokens = 0
             self._warned_turn = False
             self._soft_limit_warned_turn = False
             # A pending compression request survives into the next turn's
@@ -148,6 +186,8 @@ class TokenBudget:
         with self._lock:
             self.session_tokens = 0
             self.turn_tokens = 0
+            self.session_raw_tokens = 0
+            self.turn_raw_tokens = 0
             self.last_prompt_tokens = 0
             self.api_calls = 0
             self.exceeded = False
@@ -158,26 +198,96 @@ class TokenBudget:
             self._soft_limit_warned_turn = False
 
     def record(self, usage: Any) -> int:
-        """Account one API response's usage.  Returns tokens added.
+        """Account one API response's usage.  Returns *weighted* tokens added.
 
         Accepts the loop's ``usage_dict`` (``prompt_tokens`` /
         ``completion_tokens`` / ``total_tokens``) or any object exposing
         the same or the Anthropic-style ``input_tokens`` / ``output_tokens``
-        fields.  When ``total_tokens`` is missing it is derived.
+        fields.
+
+        Limits are checked against a **cost-weighted** total -- fresh prompt
+        + completion + cache writes + reasoning, plus cache reads scaled by
+        :attr:`cache_read_weight` -- not the provider's raw ``total_tokens``,
+        which bills a re-sent cached prefix at full price (hermes-agent#62).
+        The raw total is still accumulated in ``*_raw_tokens`` for display.
+
+        The two provider conventions are handled separately: OpenAI-style
+        ``prompt_tokens`` *includes* the cached prefix, so it is subtracted
+        out; Anthropic-style ``input_tokens`` excludes it and is used as-is.
+        Getting this wrong double-counts the cache on one family or the
+        other.
         """
         if usage is None:
             return 0
-        prompt = _usage_int(usage, "prompt_tokens", "input_tokens")
         completion = _usage_int(usage, "completion_tokens", "output_tokens")
-        total = _usage_int(usage, "total_tokens") or (prompt + completion)
+        cache_read = _usage_int(
+            usage, "cache_read_tokens", "cache_read_input_tokens", "cached_tokens"
+        )
+        cache_write = _usage_int(
+            usage, "cache_write_tokens", "cache_creation_input_tokens"
+        )
+        # NOTE: ``reasoning_tokens`` is deliberately NOT added.  It is a
+        # breakdown of the completion, not an extra charge: across 261 of 261
+        # observed turns carrying reasoning tokens, total == input + output +
+        # cache_read + cache_write exactly, with reasoning already inside
+        # output.  Adding it again overcharges every reasoning-model turn.
+
+        # Fresh (uncached) prompt tokens, normalised across providers.
+        if _usage_has(usage, "prompt_tokens"):
+            # OpenAI-style: prompt_tokens covers the whole prompt, cached
+            # portion included.  Never let rounding drive this negative.
+            fresh_prompt = max(0, _usage_int(usage, "prompt_tokens") - cache_read)
+        else:
+            # Anthropic-style: input_tokens is already cache-exclusive.
+            fresh_prompt = _usage_int(usage, "input_tokens")
+
+        weighted = int(
+            fresh_prompt
+            + completion
+            + cache_write
+            + round(self.cache_read_weight * cache_read)
+        )
+        raw = _usage_int(usage, "total_tokens") or (
+            fresh_prompt + completion + cache_read + cache_write
+        )
+
+        # Providers (and older call sites) that report only an opaque
+        # ``total_tokens`` give us nothing to weight.  Charge it in full
+        # rather than silently recording zero -- undercounting to 0 would
+        # disable the budget outright, which is far worse than the
+        # over-counting this fix exists to remove.
+        if not any(
+            _usage_has(usage, name)
+            for name in (
+                "prompt_tokens",
+                "input_tokens",
+                "completion_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_read_input_tokens",
+                "cached_tokens",
+                "cache_write_tokens",
+                "cache_creation_input_tokens",
+                "reasoning_tokens",
+            )
+        ):
+            weighted = raw
+
+        # Context size for the soft limit is the whole prompt actually sent,
+        # cached prefix included -- a 100k context is 100k of context whether
+        # or not the provider served it from cache.
+        context_tokens = fresh_prompt + cache_read + cache_write
+
         with self._lock:
-            self.session_tokens += total
-            self.turn_tokens += total
-            self.last_prompt_tokens = prompt
+            self.session_tokens += weighted
+            self.turn_tokens += weighted
+            self.session_raw_tokens += raw
+            self.turn_raw_tokens += raw
+            self.last_prompt_tokens = context_tokens
             self.api_calls += 1
-            if self.context_soft_limit and prompt > self.context_soft_limit:
+            if self.context_soft_limit and context_tokens > self.context_soft_limit:
                 self._compression_requested = True
-        return total
+        return weighted
 
     # ── checks ──────────────────────────────────────────────────────
 
@@ -276,11 +386,28 @@ class TokenBudget:
     def _fmt_limit(limit: int) -> str:
         return f"{limit:,}" if limit else "unlimited"
 
+    def _raw_note(self) -> str:
+        """`` (raw N incl. cache reads)`` when weighting actually discounted.
+
+        Empty when the weight is 1.0 or nothing was cached, so the common
+        message stays short.  Shown so a genuine breach is distinguishable
+        from a cache-heavy one at a glance.
+        """
+        if self.cache_read_weight >= 1.0:
+            return ""
+        if self.session_raw_tokens <= self.session_tokens:
+            return ""
+        return (
+            f" [raw {self.session_raw_tokens:,} incl. cache reads, charged at "
+            f"{self.cache_read_weight:g}x]"
+        )
+
     def stop_message(self) -> str:
         return (
             f"Stopped: this session has used {self.session_tokens:,} tokens of its "
             f"{self._fmt_limit(self.per_session)} budget "
-            f"(turn: {self.turn_tokens:,}/{self._fmt_limit(self.per_turn)}). "
+            f"(turn: {self.turn_tokens:,}/{self._fmt_limit(self.per_turn)})."
+            f"{self._raw_note()} "
             "Reply `continue` to allow one more turn, or start a new session."
         )
 
@@ -306,8 +433,11 @@ class TokenBudget:
             "context_soft_limit": self.context_soft_limit,
             "action": self.action,
             "platform": self.platform,
+            "cache_read_weight": self.cache_read_weight,
             "session_tokens": self.session_tokens,
             "turn_tokens": self.turn_tokens,
+            "session_raw_tokens": self.session_raw_tokens,
+            "turn_raw_tokens": self.turn_raw_tokens,
             "last_prompt_tokens": self.last_prompt_tokens,
             "exceeded": self.exceeded,
             "extensions_granted": self.extensions_granted,

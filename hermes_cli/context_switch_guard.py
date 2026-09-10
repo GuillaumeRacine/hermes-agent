@@ -102,7 +102,12 @@ def merge_preflight_compression_warning(
     if estimate < new_threshold:
         return
 
-    if int(getattr(cc, "_ineffective_compression_count", 0) or 0) >= 2:
+    # Read the compressor's own gate, not the legacy consecutive counter: the
+    # window guard can be backing off while that counter still reads 1, and we
+    # would then promise a preflight compaction that will not run.
+    if bool(getattr(cc, "compression_backoff_active", False)) or int(
+        getattr(cc, "_ineffective_compression_count", 0) or 0
+    ) >= 2:
         return
 
     parts: list[str] = []

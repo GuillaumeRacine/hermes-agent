@@ -179,6 +179,10 @@ _AUTO_FOCUS_MAX_CHARS = 700
 _OUTCOME_WINDOW = 3
 _OUTCOME_TRIGGER = 2
 _MIN_SAVINGS_PCT = 10.0
+# Share of the context window above which back-off is overridden and a
+# compaction runs regardless. An overflow is a certain failure; an ineffective
+# compaction is a wasted call.
+_BACKOFF_OVERRIDE_RATIO = 0.9
 
 # Keep a short run of recent messages verbatim even when the token budget is
 # already exhausted.  The public ``protect_last_n`` default is intentionally
@@ -930,6 +934,20 @@ class ContextCompressor(ContextEngine):
         self._last_aux_model_failure_model: Optional[str] = None
 
     @property
+    def compression_backoff_active(self) -> bool:
+        """True when :meth:`should_compress` is currently backing off.
+
+        The public gate. ``_ineffective_compression_count`` is a *consecutive*
+        counter and no longer tells the whole story: on the alternating pattern
+        this guard exists to catch, ``[True, False, True]``, the window has
+        tripped while the counter reads 1. Callers that ask "will compaction
+        run?" -- notably ``hermes_cli.context_switch_guard`` -- must read this,
+        or they will promise the user a compaction that will not happen.
+        """
+        legacy = int(getattr(self, "_ineffective_compression_count", 0) or 0)
+        return sum(self._outcomes) >= _OUTCOME_TRIGGER or legacy >= _OUTCOME_TRIGGER
+
+    @property
     def _outcomes(self) -> "Deque[bool]":
         """Back-off window, created on demand.
 
@@ -938,7 +956,9 @@ class ContextCompressor(ContextEngine):
         test, so ``__init__`` state cannot be assumed to exist.
         """
         win = getattr(self, "_recent_outcomes", None)
-        if win is None:
+        # isinstance, not `is None`: a plain list assigned here would silently
+        # lose maxlen and the window could then never forget a failure.
+        if not isinstance(win, deque):
             win = deque(maxlen=_OUTCOME_WINDOW)
             self._recent_outcomes = win
         return win
@@ -956,22 +976,29 @@ class ContextCompressor(ContextEngine):
                 sum(self._outcomes), len(self._outcomes),
             )
 
-    def _settle_pending_on_estimate(self, current_tokens: int) -> None:
+    def _settle_pending_on_estimate(self) -> None:
         """Close out a pending check when real usage never arrived.
 
-        Real provider usage is the better signal, so this only runs when the
-        next compression starts with the previous one still unsettled.
+        Uses the savings the pass measured *on its own message list*, parked at
+        compression time. It must NOT recompute from the current context: this
+        runs at the top of the next ``compress()``, where the only size
+        available is that next pass's PRE-compaction total. Both figures sit
+        just above ``threshold_tokens`` by construction -- compaction re-fires
+        only once context has grown back -- so a recomputed ratio is ~0% for
+        every pass, however well it worked. That scored good passes as
+        ineffective and latched the guard off permanently on any provider that
+        omits ``usage`` (streaming endpoints without include_usage, some local
+        servers, proxies), which is the context-overflow failure this guard
+        exists to prevent.
         """
-        before = getattr(self, "_pending_effectiveness", None)
-        if before is None:
+        pending = getattr(self, "_pending_effectiveness", None)
+        if pending is None:
             return
         self._pending_effectiveness = None
-        if before <= 0 or current_tokens <= 0:
-            return
-        pct = (before - current_tokens) / before * 100
+        _before, own_pct = pending
         self._record_outcome(
-            pct < _MIN_SAVINGS_PCT, "estimate (no real usage)",
-            f"{before:,} -> {current_tokens:,} ({pct:.0f}%)",
+            own_pct < _MIN_SAVINGS_PCT, "estimate (no real usage)",
+            f"own-pass savings {own_pct:.0f}%",
         )
 
     def update_from_response(self, usage: Dict[str, Any]):
@@ -984,14 +1011,23 @@ class ContextCompressor(ContextEngine):
         # the pass actually bought anything.
         _pending = getattr(self, "_pending_effectiveness", None)
         if _pending is not None and prompt > 0:
-            before = _pending
+            before, _own_pct = _pending
             self._pending_effectiveness = None
             if before > 0:
-                real_pct = (before - prompt) / before * 100
+                # ``prompt`` includes everything added AFTER the compaction --
+                # the new user turn and any tool results. Charging that growth
+                # against the pass scores a good compaction as ineffective
+                # whenever a large file read or fetch lands right after it, and
+                # two such turns latch the guard. Credit the pass only with what
+                # it actually removed, using the post-compaction size it
+                # recorded; fall back to the raw comparison when that is absent.
+                after = getattr(self, "last_compression_rough_tokens", 0) or prompt
+                measured = min(after, prompt)
+                real_pct = (before - measured) / before * 100
                 self._last_compression_savings_pct = real_pct
                 self._record_outcome(
                     real_pct < _MIN_SAVINGS_PCT, "real usage",
-                    f"{before:,} -> {prompt:,} ({real_pct:.0f}%)",
+                    f"{before:,} -> {measured:,} ({real_pct:.0f}%)",
                 )
 
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
@@ -1058,8 +1094,30 @@ class ContextCompressor(ContextEngine):
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if tokens < self.threshold_tokens:
             return False
-        # Anti-thrashing: back off when the recent window is mostly ineffective.
-        if sum(self._outcomes) >= _OUTCOME_TRIGGER:
+        # Anti-thrashing: back off when the recent window is mostly ineffective,
+        # OR when the legacy consecutive counter has tripped. Both are honoured
+        # deliberately: `hermes_cli/context_switch_guard.py` reads
+        # `_ineffective_compression_count >= 2` as a public-ish signal, and
+        # callers/tests set it directly. Dropping it would have silently
+        # disabled back-off for anything that sets the counter without going
+        # through _record_outcome().
+        backing_off = self.compression_backoff_active
+        # Never let back-off ride into a provider rejection. Above this share of
+        # the window an overflow error is imminent and certain, while another
+        # compaction is merely likely to be ineffective -- always take the
+        # compaction. Without this the guard could sit at 99% of context
+        # returning False, turning "we compacted for nothing" into "every turn
+        # fails and retries".
+        if backing_off and self.context_length:
+            if tokens >= int(self.context_length * _BACKOFF_OVERRIDE_RATIO):
+                if not self.quiet_mode:
+                    logger.warning(
+                        "Compression back-off overridden: %s tokens is >=%.0f%% of the "
+                        "%s-token window — compacting anyway to avoid an overflow.",
+                        f"{tokens:,}", _BACKOFF_OVERRIDE_RATIO * 100, f"{self.context_length:,}",
+                    )
+                return True
+        if backing_off:
             if not self.quiet_mode:
                 logger.warning(
                     "Compression skipped — %d of the last %d passes saved <%.0f%%. "
@@ -2506,12 +2564,19 @@ This compaction should PRIORITISE preserving all information related to the focu
             return messages
 
         display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
+        # ``-1`` is a live sentinel: conversation_compression sets
+        # last_prompt_tokens = -1 after a compaction and conversation_loop
+        # forwards it as approx_tokens. Left alone it makes savings_pct
+        # meaningless and parks a negative baseline that both settle paths
+        # silently drop, quietly shrinking the back-off window.
+        if display_tokens <= 0:
+            display_tokens = estimate_messages_tokens_rough(messages)
 
         # A previous pass is still awaiting real usage that never came (session
         # ended, or the provider omitted usage). Settle it on the estimate now
         # rather than dropping it: an unsettled outcome silently shrinks the
         # back-off window and lets thrash resume.
-        self._settle_pending_on_estimate(display_tokens)
+        self._settle_pending_on_estimate()
 
         # Phase 1: Prune old tool results (cheap, no LLM call)
         messages, pruned_count = self._prune_old_tool_results(
@@ -2762,8 +2827,13 @@ This compaction should PRIORITISE preserving all information related to the focu
         # settles this against the provider's next prompt_tokens. The estimate
         # only decides the outcome when real usage never arrives (session ends,
         # provider omits usage) -- see _settle_pending_on_estimate().
+        # (real pre-compaction prompt size, this pass's own measured savings).
+        # update_from_response() prefers the first; _settle_pending_on_estimate()
+        # falls back to the second. Never recompute the fallback from a later
+        # context -- see that method.
         self._pending_effectiveness = (
-            getattr(self, "last_real_prompt_tokens", 0) or display_tokens
+            getattr(self, "last_real_prompt_tokens", 0) or display_tokens,
+            savings_pct,
         )
 
         if not self.quiet_mode:

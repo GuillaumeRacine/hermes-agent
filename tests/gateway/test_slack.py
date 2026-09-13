@@ -126,6 +126,128 @@ def _redirect_cache(tmp_path, monkeypatch):
     )
 
 
+class TestSlackReactionFeedback:
+    @pytest.mark.asyncio
+    async def test_thumb_votes_persist_and_latest_vote_wins(
+        self,
+        adapter,
+        tmp_path,
+        monkeypatch,
+    ):
+        import json
+
+        state_path = tmp_path / "trend_feedback.json"
+        monkeypatch.setenv("SLACK_REACTION_FEEDBACK_CHANNELS", "C_TRENDS")
+        monkeypatch.setenv("SLACK_REACTION_FEEDBACK_USERS", "U_GUI")
+        monkeypatch.setenv(
+            "SLACK_REACTION_FEEDBACK_STATE",
+            str(state_path),
+        )
+        monkeypatch.setenv(
+            "SLACK_REACTION_FEEDBACK_MARKER",
+            "React 👍/👎 to tune future briefs.",
+        )
+        adapter._app.client.reactions_get = AsyncMock(
+            return_value={
+                "message": {
+                    "ts": "111.223",
+                    "thread_ts": "111.222",
+                    "user": "U_BOT",
+                    "text": (
+                        "*1. Agent infrastructure shift* — X rank #43/50\n"
+                        "React 👍/👎 to tune future briefs."
+                    ),
+                }
+            }
+        )
+        base_event = {
+            "team": "T1",
+            "user": "U_GUI",
+            "item_user": "U_BOT",
+            "item": {
+                "type": "message",
+                "channel": "C_TRENDS",
+                "ts": "111.223",
+            },
+        }
+
+        await adapter._handle_reaction_feedback(
+            {**base_event, "reaction": "thumbsup"},
+            added=True,
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        entry = next(iter(state["entries"].values()))
+        assert entry["sentiment"] == "up"
+        assert entry["active"] is True
+        assert entry["thread_ts"] == "111.222"
+        assert "React 👍/👎" not in entry["message_text"]
+
+        await adapter._handle_reaction_feedback(
+            {**base_event, "reaction": "thumbsdown"},
+            added=True,
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        entry = next(iter(state["entries"].values()))
+        assert entry["sentiment"] == "down"
+        assert entry["reaction"] == "thumbsdown"
+        assert entry["active"] is True
+
+        # Removing the older opposite reaction does not erase the newer vote.
+        await adapter._handle_reaction_feedback(
+            {**base_event, "reaction": "thumbsup"},
+            added=False,
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        entry = next(iter(state["entries"].values()))
+        assert entry["sentiment"] == "down"
+        assert entry["active"] is True
+
+        await adapter._handle_reaction_feedback(
+            {**base_event, "reaction": "thumbsdown"},
+            added=False,
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        entry = next(iter(state["entries"].values()))
+        assert entry["active"] is False
+
+    @pytest.mark.asyncio
+    async def test_feedback_is_fail_closed_for_unapproved_users(
+        self,
+        adapter,
+        tmp_path,
+        monkeypatch,
+    ):
+        state_path = tmp_path / "trend_feedback.json"
+        monkeypatch.setenv("SLACK_REACTION_FEEDBACK_CHANNELS", "C_TRENDS")
+        monkeypatch.setenv("SLACK_REACTION_FEEDBACK_USERS", "U_GUI")
+        monkeypatch.setenv(
+            "SLACK_REACTION_FEEDBACK_STATE",
+            str(state_path),
+        )
+        monkeypatch.setenv(
+            "SLACK_REACTION_FEEDBACK_MARKER",
+            "React 👍/👎 to tune future briefs.",
+        )
+
+        await adapter._handle_reaction_feedback(
+            {
+                "team": "T1",
+                "user": "U_SOMEONE_ELSE",
+                "item_user": "U_BOT",
+                "reaction": "thumbsup",
+                "item": {
+                    "type": "message",
+                    "channel": "C_TRENDS",
+                    "ts": "111.223",
+                },
+            },
+            added=True,
+        )
+
+        adapter._app.client.reactions_get.assert_not_awaited()
+        assert not state_path.exists()
+
+
 # ---------------------------------------------------------------------------
 # TestSlashCommandSessionIsolation
 # ---------------------------------------------------------------------------

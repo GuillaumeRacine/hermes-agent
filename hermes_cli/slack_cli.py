@@ -76,6 +76,7 @@ def _build_full_manifest(
         "im:history",
         "im:read",
         "im:write",
+        "reactions:read",
         "users:read",
     ]
 
@@ -84,6 +85,8 @@ def _build_full_manifest(
         "message.channels",
         "message.groups",
         "message.im",
+        "reaction_added",
+        "reaction_removed",
     ]
 
     if include_assistant:

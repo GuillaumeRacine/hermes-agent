@@ -89,15 +89,39 @@ def test_run_one_job_empty_response_is_soft_failure(monkeypatch):
 
 
 def test_run_one_job_failed_job_delivers_error(monkeypatch):
-    """A failed job still delivers (the error notice) and marks not-ok."""
+    """A new failed job delivers the error notice and marks not-ok."""
     calls = _patch_pipeline(monkeypatch, success=False, final="", error="boom")
 
     s.run_one_job({"id": "j5", "name": "t"})
 
     kinds = [c[0] for c in calls]
-    assert "deliver" in kinds  # failures always deliver
+    assert "deliver" in kinds
     mark = [c for c in calls if c[0] == "mark"][0]
     assert mark == ("mark", "j5", False)
+
+
+def test_run_one_job_repeated_same_failure_skips_duplicate_delivery(monkeypatch):
+    """An unchanged consecutive cron failure is saved + marked, but not re-alerted."""
+    calls = _patch_pipeline(monkeypatch, success=False, final="", error="boom")
+
+    s.run_one_job({"id": "j5b", "name": "t", "last_status": "error", "last_error": "boom"})
+
+    kinds = [c[0] for c in calls]
+    assert "save" in kinds and "mark" in kinds
+    assert "deliver" not in kinds
+
+
+def test_run_one_job_changed_failure_signature_delivers_again(monkeypatch):
+    """A repeated failing job alerts again when the error signature changes."""
+    calls = _patch_pipeline(monkeypatch, success=False, final="", error="new boom")
+
+    s.run_one_job({"id": "j5c", "name": "t", "last_status": "error", "last_error": "old boom"})
+
+    assert "deliver" in [c[0] for c in calls]
+
+
+def test_cron_failure_summary_has_no_emoji():
+    assert s._summarize_cron_failure_for_delivery({"id": "j", "name": "t"}, "boom") == "Cron 't' failed: boom"
 
 
 def test_run_one_job_exception_marks_failure(monkeypatch):

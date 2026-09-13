@@ -7,9 +7,11 @@ from ``hermes_cli.config`` (get_env_value / save_env_value) and
 ``hermes_cli.cli_output`` (prompt / prompt_yes_no / print_*), so we patch those
 source modules.
 """
+import os
+
 import hermes_cli.config as config_mod
 import hermes_cli.cli_output as cli_output_mod
-from plugins.platforms.slack.adapter import interactive_setup
+from plugins.platforms.slack.adapter import _apply_yaml_config, interactive_setup
 
 
 def _patch_setup_io(monkeypatch, prompts, saved):
@@ -55,3 +57,29 @@ def test_interactive_setup_home_channel_empty_not_saved(monkeypatch, tmp_path):
     interactive_setup()
 
     assert "SLACK_HOME_CHANNEL" not in saved
+
+
+def test_yaml_bridge_exports_reaction_feedback_settings(monkeypatch, tmp_path):
+    for name in (
+        "SLACK_REACTION_FEEDBACK_CHANNELS",
+        "SLACK_REACTION_FEEDBACK_USERS",
+        "SLACK_REACTION_FEEDBACK_STATE",
+        "SLACK_REACTION_FEEDBACK_MARKER",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    state_path = tmp_path / "feedback.json"
+    _apply_yaml_config(
+        {},
+        {
+            "reaction_feedback_channels": ["C_TRENDS"],
+            "reaction_feedback_users": ["U_GUI"],
+            "reaction_feedback_state": str(state_path),
+            "reaction_feedback_marker": "React here.",
+        },
+    )
+
+    assert os.environ["SLACK_REACTION_FEEDBACK_CHANNELS"] == "C_TRENDS"
+    assert os.environ["SLACK_REACTION_FEEDBACK_USERS"] == "U_GUI"
+    assert os.environ["SLACK_REACTION_FEEDBACK_STATE"] == str(state_path)
+    assert os.environ["SLACK_REACTION_FEEDBACK_MARKER"] == "React here."

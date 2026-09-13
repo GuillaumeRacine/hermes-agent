@@ -473,6 +473,10 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+        # Serialize durable reaction-feedback writes. Slack can deliver
+        # reaction_added / reaction_removed events close together, and a
+        # read-modify-write race would otherwise lose the user's latest vote.
+        self._reaction_feedback_lock = asyncio.Lock()
 
     def _start_socket_mode_handler(self) -> None:
         """Start the Slack Socket Mode background task."""
@@ -988,17 +992,16 @@ class SlackAdapter(BasePlatformAdapter):
             async def handle_file_change(event, say):
                 pass
 
-            # Reactions are useful lightweight acknowledgements in Slack, but
-            # Hermes does not currently need to route them into the agent loop.
-            # Ack the events explicitly so high-traffic channels do not fill
-            # gateway.error.log with Slack Bolt "Unhandled request" warnings.
+            # Configured channels can use 👍/👎 reactions on bot-authored
+            # feedback items as a durable preference signal. Other reactions
+            # are still acknowledged without entering the agent loop.
             @self._app.event("reaction_added")
             async def handle_reaction_added(event, say):
-                pass
+                await self._handle_reaction_feedback(event, added=True)
 
             @self._app.event("reaction_removed")
             async def handle_reaction_removed(event, say):
-                pass
+                await self._handle_reaction_feedback(event, added=False)
 
             @self._app.event("assistant_thread_started")
             async def handle_assistant_thread_started(event, say):
@@ -1222,6 +1225,174 @@ class SlackAdapter(BasePlatformAdapter):
         if team_id and team_id in self._team_clients:
             return self._team_clients[team_id]
         return self._app.client  # fallback to primary
+
+    @staticmethod
+    def _reaction_feedback_csv(name: str) -> set[str]:
+        """Return a normalized comma-separated reaction-feedback setting."""
+        return {
+            value.strip()
+            for value in os.getenv(name, "").split(",")
+            if value.strip()
+        }
+
+    @staticmethod
+    def _reaction_feedback_state_path() -> _Path:
+        configured = os.getenv("SLACK_REACTION_FEEDBACK_STATE", "").strip()
+        if configured:
+            return _Path(configured).expanduser()
+        from hermes_constants import get_hermes_home
+
+        return _Path(get_hermes_home()) / "state" / "slack_reaction_feedback.json"
+
+    @staticmethod
+    def _write_reaction_feedback_state(path: _Path, payload: dict) -> None:
+        """Atomically persist a bounded, private reaction-feedback document."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp_path, path)
+
+    async def _handle_reaction_feedback(self, event: dict, *, added: bool) -> None:
+        """Persist configured 👍/👎 reactions on bot-authored feedback items.
+
+        The handler is intentionally deterministic and never invokes the agent.
+        A later cron pre-run script turns active entries into compact curation
+        context. This keeps emoji clicks cheap, private, and durable.
+        """
+        channels = self._reaction_feedback_csv(
+            "SLACK_REACTION_FEEDBACK_CHANNELS"
+        )
+        users = self._reaction_feedback_csv("SLACK_REACTION_FEEDBACK_USERS")
+        if not channels or not users:
+            return
+
+        item = event.get("item") or {}
+        channel_id = str(item.get("channel") or "")
+        message_ts = str(item.get("ts") or "")
+        user_id = str(event.get("user") or "")
+        reaction = str(event.get("reaction") or "").lower()
+        if (
+            item.get("type") != "message"
+            or channel_id not in channels
+            or user_id not in users
+            or not message_ts
+        ):
+            return
+
+        sentiment_by_reaction = {
+            "thumbsup": "up",
+            "+1": "up",
+            "thumbsdown": "down",
+            "-1": "down",
+        }
+        sentiment = sentiment_by_reaction.get(reaction)
+        if sentiment is None:
+            return
+
+        try:
+            result = await self._get_client(channel_id).reactions_get(
+                channel=channel_id,
+                timestamp=message_ts,
+                full=True,
+            )
+            message = (result or {}).get("message") or {}
+        except Exception as exc:
+            logger.warning(
+                "[Slack] Could not fetch reaction-feedback message %s:%s: %s",
+                channel_id,
+                message_ts,
+                exc,
+            )
+            return
+
+        bot_user_id = self._team_bot_user_ids.get(
+            str(event.get("team") or ""),
+            self._bot_user_id,
+        )
+        item_user = str(event.get("item_user") or "")
+        message_user = str(message.get("user") or "")
+        if not bot_user_id or bot_user_id not in {item_user, message_user}:
+            return
+
+        text = str(message.get("text") or "").strip()
+        feedback_marker = os.getenv(
+            "SLACK_REACTION_FEEDBACK_MARKER",
+            "React 👍/👎 to tune future briefs.",
+        ).strip()
+        if not text or (feedback_marker and feedback_marker not in text):
+            return
+
+        path = self._reaction_feedback_state_path()
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        key = f"{channel_id}:{message_ts}:{user_id}"
+
+        async with self._reaction_feedback_lock:
+            state: dict = {"version": 1, "entries": {}}
+            try:
+                if path.exists():
+                    loaded = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        state = loaded
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning(
+                    "[Slack] Reaction-feedback state unreadable at %s: %s",
+                    path,
+                    exc,
+                )
+
+            entries = state.get("entries")
+            if not isinstance(entries, dict):
+                entries = {}
+                state["entries"] = entries
+
+            current = entries.get(key) if isinstance(entries.get(key), dict) else {}
+            # Removing an older opposite reaction must not erase a newer vote.
+            active = bool(added)
+            if not added and current.get("reaction") not in {None, reaction}:
+                active = bool(current.get("active"))
+                reaction = str(current.get("reaction") or reaction)
+                sentiment = str(current.get("sentiment") or sentiment)
+
+            cleaned_text = text.replace(feedback_marker, "").strip()
+            entries[key] = {
+                "channel_id": channel_id,
+                "message_ts": message_ts,
+                "thread_ts": str(message.get("thread_ts") or ""),
+                "user_id": user_id,
+                "reaction": reaction,
+                "sentiment": sentiment,
+                "active": active,
+                "message_text": cleaned_text,
+                "updated_at": now,
+            }
+
+            # Bound storage while preserving the newest explicit preferences.
+            if len(entries) > 200:
+                newest = sorted(
+                    entries.items(),
+                    key=lambda pair: str(pair[1].get("updated_at") or ""),
+                    reverse=True,
+                )[:200]
+                state["entries"] = dict(newest)
+
+            state["updated_at"] = now
+            self._write_reaction_feedback_state(path, state)
+            logger.info(
+                "[Slack] Stored reaction feedback channel=%s ts=%s user=%s "
+                "sentiment=%s active=%s",
+                channel_id,
+                message_ts,
+                user_id,
+                sentiment,
+                active,
+            )
 
     async def send(
         self,
@@ -4235,6 +4406,36 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         if isinstance(ac, list):
             ac = ",".join(str(v) for v in ac)
         os.environ["SLACK_ALLOWED_CHANNELS"] = str(ac)
+    feedback_channels = slack_cfg.get("reaction_feedback_channels")
+    if (
+        feedback_channels is not None
+        and not os.getenv("SLACK_REACTION_FEEDBACK_CHANNELS")
+    ):
+        if isinstance(feedback_channels, list):
+            feedback_channels = ",".join(str(v) for v in feedback_channels)
+        os.environ["SLACK_REACTION_FEEDBACK_CHANNELS"] = str(feedback_channels)
+    feedback_users = slack_cfg.get("reaction_feedback_users")
+    if (
+        feedback_users is not None
+        and not os.getenv("SLACK_REACTION_FEEDBACK_USERS")
+    ):
+        if isinstance(feedback_users, list):
+            feedback_users = ",".join(str(v) for v in feedback_users)
+        os.environ["SLACK_REACTION_FEEDBACK_USERS"] = str(feedback_users)
+    if (
+        "reaction_feedback_state" in slack_cfg
+        and not os.getenv("SLACK_REACTION_FEEDBACK_STATE")
+    ):
+        os.environ["SLACK_REACTION_FEEDBACK_STATE"] = str(
+            slack_cfg["reaction_feedback_state"]
+        )
+    if (
+        "reaction_feedback_marker" in slack_cfg
+        and not os.getenv("SLACK_REACTION_FEEDBACK_MARKER")
+    ):
+        os.environ["SLACK_REACTION_FEEDBACK_MARKER"] = str(
+            slack_cfg["reaction_feedback_marker"]
+        )
     return None  # all settings flow through env; nothing to merge into extras
 
 

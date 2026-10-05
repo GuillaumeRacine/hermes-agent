@@ -33,6 +33,22 @@ from typing import Any, Dict, Optional
 
 TOKEN_BUDGET_EXCEEDED = "token_budget_exceeded"
 
+# Leading text of every stop-mode pause notice.  The conversation loop also
+# uses it to recognise "the previous assistant turn was a budget pause" from
+# the transcript alone, so a ``continue`` still resumes after the gateway
+# evicted and rebuilt the cached agent (which drops in-memory flags).
+PAUSE_MARKER = "Paused (token budget):"
+
+# Model-facing text substituted for a bare ``continue`` that follows a
+# budget pause.  The transcript keeps the user's literal ``continue``.
+RESUME_INSTRUCTION = (
+    "continue\n\n[System note: your previous turn was paused by the token "
+    "budget, not finished. Resume the same task from where you stopped. Do "
+    "not repeat steps whose results are already in the conversation; if the "
+    "remaining work is small, finish it, otherwise make concrete progress and "
+    "report what is done and what is left.]"
+)
+
 
 def _usage_int(usage: Any, *names: str) -> int:
     """Read the first present integer-ish field from a usage dict/object."""
@@ -276,13 +292,63 @@ class TokenBudget:
     def _fmt_limit(limit: int) -> str:
         return f"{limit:,}" if limit else "unlimited"
 
-    def stop_message(self) -> str:
-        return (
-            f"Stopped: this session has used {self.session_tokens:,} tokens of its "
-            f"{self._fmt_limit(self.per_session)} budget "
-            f"(turn: {self.turn_tokens:,}/{self._fmt_limit(self.per_turn)}). "
-            "Reply `continue` to allow one more turn, or start a new session."
-        )
+    def stop_message(
+        self,
+        reason: Optional[str] = None,
+        *,
+        progress: Optional[str] = None,
+    ) -> str:
+        """User-facing pause notice for a stop-mode breach.
+
+        ``reason`` is the value :meth:`breach` returned (``"per_turn"`` /
+        ``"per_session"``); when omitted it is inferred from the counters,
+        session first.  The notice names the limit that actually fired --
+        the pre-#330 text always said "this session has used X of its Y
+        budget" even when the *turn* cap fired, which read as if a 4M
+        session budget had been blown at 1.5M (hermes-home#330).
+
+        ``progress`` is an optional one-line "where I stopped" description
+        (see :func:`describe_progress`) so the user knows what a
+        ``continue`` will resume.
+        """
+        if reason is None:
+            reason = self.last_breach
+        if reason is None:
+            if self.session_exceeded():
+                reason = "per_session"
+            elif self.turn_exceeded():
+                reason = "per_turn"
+        if reason == "per_turn":
+            headline = (
+                f"{PAUSE_MARKER} this task used {self.turn_tokens:,} tokens in a "
+                f"single turn, over the per-turn limit of "
+                f"{self._fmt_limit(self.per_turn)} (session total "
+                f"{self.session_tokens:,} of {self._fmt_limit(self.per_session)})."
+            )
+            tail = (
+                "Reply `continue` to resume where I left off "
+                "(the per-turn counter resets on each new turn)."
+            )
+        else:
+            headline = (
+                f"{PAUSE_MARKER} this session has used {self.session_tokens:,} "
+                f"tokens of its {self._fmt_limit(self.per_session)} session budget "
+                f"(this turn: {self.turn_tokens:,}/{self._fmt_limit(self.per_turn)})."
+            )
+            amount = self.extension_amount()
+            extra = f" (+{amount:,} tokens)" if amount else ""
+            tail = (
+                f"Reply `continue` to extend the budget{extra} and resume "
+                "where I left off, or start a new session."
+            )
+        parts = [headline]
+        if progress:
+            prog = progress.strip()
+            if prog and prog[-1] not in ".!?":
+                prog += "."
+            parts.append(f"Progress so far: {prog}")
+        parts.append(tail)
+        return " ".join(parts)
 
     def warn_message(self, reason: Optional[str] = None) -> str:
         scope = "turn" if reason == "per_turn" else "session"
@@ -317,6 +383,43 @@ class TokenBudget:
         return f"TokenBudget({self.as_dict()!r})"
 
 
+def describe_progress(messages: Any, api_call_count: int = 0, max_tools: int = 4) -> str:
+    """One-line "where I stopped" summary built from the turn's transcript.
+
+    Pure / local: no API call, so it is safe to use exactly when the budget
+    says no more tokens may be spent.  Reports the step count and the most
+    recent distinct tool names, e.g. ``"stopped at step 17; recent tools:
+    web_search, read_file"``.
+    """
+    recent: list = []
+    try:
+        for msg in reversed(list(messages or [])):
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            for tc in reversed(msg.get("tool_calls") or []):
+                fn = tc.get("function") if isinstance(tc, dict) else getattr(tc, "function", None)
+                name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
+                if name and name not in recent:
+                    recent.append(name)
+                if len(recent) >= max_tools:
+                    break
+            if len(recent) >= max_tools:
+                break
+    except Exception:
+        recent = []
+    parts = []
+    if api_call_count:
+        parts.append(f"stopped at step {api_call_count}")
+    if recent:
+        parts.append("recent tools: " + ", ".join(reversed(recent)))
+    return "; ".join(parts)
+
+
+def is_budget_pause_message(content: Any) -> bool:
+    """True when ``content`` is a stop-mode pause notice (see PAUSE_MARKER)."""
+    return isinstance(content, str) and content.lstrip().startswith(PAUSE_MARKER)
+
+
 def is_continue_message(user_message: Any) -> bool:
     """True when the user message is exactly ``continue`` (trimmed, any case)."""
     if not isinstance(user_message, str):
@@ -324,4 +427,12 @@ def is_continue_message(user_message: Any) -> bool:
     return user_message.strip().lower() == "continue"
 
 
-__all__ = ["TokenBudget", "TOKEN_BUDGET_EXCEEDED", "is_continue_message"]
+__all__ = [
+    "TokenBudget",
+    "TOKEN_BUDGET_EXCEEDED",
+    "PAUSE_MARKER",
+    "RESUME_INSTRUCTION",
+    "describe_progress",
+    "is_budget_pause_message",
+    "is_continue_message",
+]

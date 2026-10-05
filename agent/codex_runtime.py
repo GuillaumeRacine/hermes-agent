@@ -22,6 +22,8 @@ import time
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
+from agent.request_hygiene import drop_orphan_tool_fields
+
 logger = logging.getLogger(__name__)
 
 
@@ -681,7 +683,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
 
-        stream_kwargs = dict(api_kwargs)
+        # Last-line guard for every Responses API send (main loop AND the
+        # max-iterations summary, which strips ``tools``): never ship a
+        # ``tool_choice`` without tools -- xAI 400s on it (hermes-home#330).
+        stream_kwargs = drop_orphan_tool_fields(dict(api_kwargs))
         stream_kwargs["stream"] = True
 
         try:

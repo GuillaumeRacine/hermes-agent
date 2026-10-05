@@ -5,7 +5,7 @@ hermes-home #233 P1-4: hard per-session / per-turn token budget.
 
 from types import SimpleNamespace
 
-from agent.token_budget import TokenBudget, is_continue_message
+from agent.token_budget import PAUSE_MARKER, describe_progress, is_budget_pause_message, TokenBudget, is_continue_message
 from hermes_cli.config import DEFAULT_CONFIG, resolve_token_budget
 
 
@@ -123,8 +123,9 @@ def test_breach_precedence_and_exceeded_state():
     assert tb.session_exceeded()
 
     assert tb.stop_message() == (
-        "Stopped: this session has used 1,600 tokens of its 1,500 budget "
-        "(turn: 400/1,000). Reply `continue` to allow one more turn, or start a new session."
+        "Paused (token budget): this session has used 1,600 tokens of its 1,500 "
+        "session budget (this turn: 400/1,000). Reply `continue` to extend the "
+        "budget (+1,000 tokens) and resume where I left off, or start a new session."
     )
     assert tb.summary() == "400/1600/1500"
 
@@ -209,3 +210,53 @@ def test_soft_limit_requests_compression_once():
     assert tb.should_warn_soft_limit_unavailable() is False  # once per turn
     tb.reset_turn()
     assert tb.should_warn_soft_limit_unavailable() is True
+
+
+# ── pause notice wording (hermes-home#330) ────────────────────────────
+
+
+def test_stop_message_names_the_turn_cap_when_turn_cap_fired():
+    """Sep 8 incident: a 1.5M per-turn cap fired at 1,536,818 tokens and the
+    notice read "1,536,818 tokens of its 4,000,000 budget" -- as if the
+    session cap had fired.  The notice must name the limit that fired."""
+    tb = TokenBudget(per_session=4_000_000, per_turn=1_500_000)
+    tb.record({"total_tokens": 1_536_818})
+    assert tb.breach() == "per_turn"
+    msg = tb.stop_message("per_turn", progress="stopped at step 17; recent tools: web_search")
+    assert msg.startswith(PAUSE_MARKER)
+    assert "per-turn limit of 1,500,000" in msg
+    assert "1,536,818 tokens in a single turn" in msg
+    assert "session total 1,536,818 of 4,000,000" in msg
+    assert "Progress so far: stopped at step 17; recent tools: web_search." in msg
+    assert "Reply `continue` to resume" in msg
+    assert "of its 4,000,000 budget" not in msg
+
+
+def test_stop_message_infers_reason_from_last_breach():
+    tb = TokenBudget(per_session=10_000, per_turn=1_000)
+    tb.record({"total_tokens": 1_200})
+    tb.breach()
+    assert "per-turn limit of 1,000" in tb.stop_message()
+
+
+def test_describe_progress_lists_recent_distinct_tools_in_order():
+    messages = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "tool_calls": [{"function": {"name": "read_file"}}]},
+        {"role": "tool", "content": "x"},
+        {"role": "assistant", "tool_calls": [
+            {"function": {"name": "web_search"}}, {"function": {"name": "read_file"}},
+        ]},
+        {"role": "tool", "content": "y"},
+    ]
+    assert describe_progress(messages, 3) == "stopped at step 3; recent tools: web_search, read_file"
+    assert describe_progress([], 0) == ""
+
+
+def test_is_budget_pause_message():
+    tb = TokenBudget(per_turn=10)
+    tb.record({"total_tokens": 20})
+    tb.breach()
+    assert is_budget_pause_message(tb.stop_message())
+    assert not is_budget_pause_message("done")
+    assert not is_budget_pause_message(None)

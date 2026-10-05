@@ -32,7 +32,13 @@ from agent.conversation_compression import conversation_history_after_compressio
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
-from agent.token_budget import TOKEN_BUDGET_EXCEEDED, is_continue_message
+from agent.token_budget import (
+    RESUME_INSTRUCTION,
+    TOKEN_BUDGET_EXCEEDED,
+    describe_progress,
+    is_budget_pause_message,
+    is_continue_message,
+)
 from agent.turn_context import build_turn_context
 from agent.turn_retry_state import TurnRetryState
 from agent.memory_manager import build_memory_context_block
@@ -565,6 +571,26 @@ def run_conversation(
             f"(session {_token_budget.session_tokens:,}/{_token_budget.per_session:,})."
         )
 
+    # ── Resume after a budget pause (hermes-home#330) ──
+    # A bare ``continue`` right after a token-budget pause (per-turn OR
+    # per-session) resumes the paused task: the model sees an explicit
+    # resume instruction while the transcript keeps the literal
+    # ``continue``.  The pause is detected from the in-memory flag or, if
+    # the gateway rebuilt the agent since, from the last assistant message.
+    if _token_budget is not None and is_continue_message(user_message):
+        _paused = bool(getattr(agent, "_token_budget_paused", False))
+        if not _paused:
+            for _hist_msg in reversed(conversation_history or []):
+                if isinstance(_hist_msg, dict) and _hist_msg.get("role") == "assistant":
+                    _paused = is_budget_pause_message(_hist_msg.get("content"))
+                    break
+        if _paused:
+            if persist_user_message is None:
+                persist_user_message = user_message
+            user_message = RESUME_INSTRUCTION
+            logger.info("Token budget: resuming paused task on `continue`")
+    agent._token_budget_paused = False
+
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
     # message sanitization, todo/nudge hydration, system-prompt restore-or-
@@ -648,10 +674,11 @@ def run_conversation(
             and _token_budget.stops
             and _token_budget.session_exceeded()
         ):
-            _token_budget.breach()
+            _tb_reason = _token_budget.breach()
             agent._token_budget_exceeded = True
+            agent._token_budget_paused = True
             _turn_exit_reason = TOKEN_BUDGET_EXCEEDED
-            final_response = _token_budget.stop_message()
+            final_response = _token_budget.stop_message(_tb_reason)
             messages.append({"role": "assistant", "content": final_response})
             logger.warning(
                 "Token budget exceeded before API call #%d: %s",
@@ -4343,8 +4370,12 @@ def run_conversation(
                     if _tb_breach:
                         if _tb_breach == "per_session":
                             agent._token_budget_exceeded = True
+                        agent._token_budget_paused = True
                         _turn_exit_reason = TOKEN_BUDGET_EXCEEDED
-                        final_response = _token_budget.stop_message()
+                        final_response = _token_budget.stop_message(
+                            _tb_breach,
+                            progress=describe_progress(messages, api_call_count),
+                        )
                         messages.append({"role": "assistant", "content": final_response})
                         logger.warning(
                             "Token budget exceeded (%s) after API call #%d: %s",

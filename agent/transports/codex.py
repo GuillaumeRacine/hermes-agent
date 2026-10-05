@@ -374,7 +374,10 @@ class ResponsesApiTransport(ProviderTransport):
             merged_extra_body.setdefault("prompt_cache_key", cache_key)
             kwargs["extra_body"] = merged_extra_body
 
-        return kwargs
+        # request_overrides may inject tool_choice even when no tools are
+        # exposed; strict providers (xAI) 400 on that (hermes-home#330).
+        from agent.request_hygiene import drop_orphan_tool_fields
+        return drop_orphan_tool_fields(kwargs)
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:
         """Normalize Codex Responses API response to NormalizedResponse."""

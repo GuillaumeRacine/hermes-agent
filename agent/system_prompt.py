@@ -279,10 +279,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             )
         except Exception:
             _compact_cats = frozenset()
+        try:
+            from agent.channel_settings import channel_skill_focus
+
+            _focus_cats = channel_skill_focus(agent)
+        except Exception:
+            _focus_cats = frozenset()
         skills_prompt = _r.build_skills_system_prompt(
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
+            focus_categories=_focus_cats or None,
         )
     else:
         skills_prompt = ""
@@ -409,7 +416,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if system_message is not None:
         context_parts.append(system_message)
 
-    if not agent.skip_context_files:
+    try:
+        from agent.channel_settings import channel_skips_context_files
+
+        _channel_skips_ctx = channel_skips_context_files(agent)
+    except Exception:
+        _channel_skips_ctx = False
+
+    if not agent.skip_context_files and not _channel_skips_ctx:
         # Prefer the configured TERMINAL_CWD (gateway mode). When unset (local
         # CLI), None lets build_context_files_prompt fall back to the launch
         # dir — the user's real cwd there, but the install dir for the gateway

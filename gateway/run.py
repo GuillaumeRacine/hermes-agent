@@ -11951,6 +11951,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
+            from agent.channel_settings import apply_channel_toolset_filter
+            enabled_toolsets, disabled_toolsets = apply_channel_toolset_filter(
+                user_config, platform_key, source.chat_id, enabled_toolsets, disabled_toolsets
+            )
 
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
@@ -15331,6 +15335,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
+        from agent.channel_settings import apply_channel_toolset_filter
+        enabled_toolsets, disabled_toolsets = apply_channel_toolset_filter(
+            user_config, platform_key, source.chat_id, enabled_toolsets, disabled_toolsets
+        )
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):

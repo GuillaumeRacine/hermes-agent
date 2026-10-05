@@ -3366,14 +3366,72 @@ class TestHandleMaxIterations:
         assert len(result) > 0
         assert "summary" in result.lower()
 
-    def test_api_failure_returns_error(self, agent):
+    def test_api_failure_never_surfaces_raw_provider_error(self, agent):
+        """hermes-home#330: a provider 400 was posted verbatim to Slack.
+        When every summary attempt fails, the user gets a locally built
+        progress note -- never the raw exception text."""
         agent.client.chat.completions.create.side_effect = Exception("API down")
         agent._cached_system_prompt = "You are helpful."
-        messages = [{"role": "user", "content": "do stuff"}]
+        messages = [
+            {"role": "user", "content": "do stuff"},
+            {"role": "assistant", "content": "Checked the calendar.",
+             "tool_calls": [{"id": "c1", "function": {"name": "calendar_list", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        ]
         result = agent._handle_max_iterations(messages, 60)
         assert isinstance(result, str)
-        assert "error" in result.lower()
-        assert "API down" in result
+        assert "API down" not in result
+        assert "Error" not in result
+        assert "step limit" in result
+        assert "calendar_list" in result
+        assert "Checked the calendar." in result
+        assert "continue" in result
+        assert messages[-1] == {"role": "assistant", "content": result}
+
+    def test_summary_failure_retries_with_plain_request(self, agent):
+        agent.client.chat.completions.create.side_effect = [
+            Exception("400 invalid-argument"),
+            _mock_response(content="Plain summary"),
+        ]
+        agent._cached_system_prompt = "You are helpful."
+        result = agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 60)
+        assert result == "Plain summary"
+        retry_kwargs = agent.client.chat.completions.create.call_args_list[-1].kwargs
+        assert "extra_body" not in retry_kwargs
+        assert "tools" not in retry_kwargs
+        assert "tool_choice" not in retry_kwargs
+
+    def test_xai_codex_summary_omits_tool_choice(self, agent):
+        """hermes-home#330: xai-oauth (Responses API) summary popped ``tools``
+        but kept ``tool_choice='auto'`` -> HTTP 400 'A tool_choice was set on
+        the request but no tools were specified'."""
+        agent.api_mode = "codex_responses"
+        agent.provider = "xai-oauth"
+        agent.base_url = "https://api.x.ai/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "api.x.ai"
+        agent.model = "grok-4"
+        agent._cached_system_prompt = "You are helpful."
+        assert agent.tools  # the main loop would send tools + tool_choice
+        captured = {}
+
+        def fake_run_codex_stream(kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                status="completed",
+                output=[SimpleNamespace(
+                    type="message", status="completed",
+                    content=[SimpleNamespace(type="output_text", text="Summary")],
+                )],
+            )
+
+        with patch.object(agent, "_run_codex_stream", side_effect=fake_run_codex_stream):
+            result = agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 60)
+
+        assert result == "Summary"
+        assert "tools" not in captured
+        assert "tool_choice" not in captured
+        assert "parallel_tool_calls" not in captured
 
     def test_summary_skips_reasoning_for_unsupported_openrouter_model(self, agent):
         agent.base_url = "https://openrouter.ai/api/v1"

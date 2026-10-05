@@ -2791,9 +2791,10 @@ class AIAgent:
         if reason == "token_budget_exceeded":
             return (
                 prefix
-                + "the session's token budget (agent.token_budget) was "
-                "exceeded. Send `continue` to allow one more turn, raise the "
-                "budget, or start a new session."
+                + "a token budget (agent.token_budget, per-turn or "
+                "per-session) was reached and the task was paused. Send "
+                "`continue` to resume it, raise the budget, or start a new "
+                "session."
             )
         if reason == "ollama_runtime_context_too_small":
             return (

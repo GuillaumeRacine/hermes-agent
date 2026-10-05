@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.token_budget import TOKEN_BUDGET_EXCEEDED, TokenBudget
+from agent.token_budget import RESUME_INSTRUCTION, TOKEN_BUDGET_EXCEEDED, TokenBudget
 
 
 def _tool_call(call_id="call_1"):
@@ -146,8 +146,10 @@ def test_per_turn_stop_ends_turn_with_reason_and_message(monkeypatch):
     assert agent._client_calls.calls == 2          # third response never requested
     assert result["turn_exit_reason"] == TOKEN_BUDGET_EXCEEDED
     assert result["final_response"] == (
-        "Stopped: this session has used 1,200 tokens of its unlimited budget "
-        "(turn: 1,200/1,000). Reply `continue` to allow one more turn, or start a new session."
+        "Paused (token budget): this task used 1,200 tokens in a single turn, over "
+        "the per-turn limit of 1,000 (session total 1,200 of unlimited). Progress "
+        "so far: stopped at step 2; recent tools: read_file. Reply `continue` to "
+        "resume where I left off (the per-turn counter resets on each new turn)."
     )
     assert result["completed"] is True
     assert result["messages"][-1] == {"role": "assistant", "content": result["final_response"]}
@@ -206,7 +208,9 @@ def test_per_session_accumulates_across_turns_and_refuses_next_turn(monkeypatch)
     assert agent._client_calls.calls == calls_before
     assert r3["turn_exit_reason"] == TOKEN_BUDGET_EXCEEDED
     assert r3["api_calls"] == 0
-    assert r3["final_response"].startswith("Stopped: this session has used 1,200 tokens of its 1,000 budget")
+    assert r3["final_response"].startswith(
+        "Paused (token budget): this session has used 1,200 tokens of its 1,000 session budget"
+    )
     assert agent._token_budget_exceeded is True
     assert r3["messages"][-1]["role"] == "assistant"
 
@@ -266,7 +270,7 @@ def test_per_session_stop_mid_turn_sets_exceeded_state(monkeypatch):
     assert result["turn_exit_reason"] == TOKEN_BUDGET_EXCEEDED
     assert agent._token_budget_exceeded is True
     assert tb.exceeded is True
-    assert "1,200 tokens of its 1,000 budget" in result["final_response"]
+    assert "1,200 tokens of its 1,000 session budget" in result["final_response"]
 
 
 def test_reset_session_state_clears_budget_counters(monkeypatch):
@@ -362,3 +366,77 @@ def test_completion_explainer_knows_token_budget(reason, needle):
         assert needle in text
     else:
         assert text == ""
+
+
+# ── pause -> `continue` resumes the task (hermes-home#330) ────────────
+
+
+class _RecordingCompletions(_FakeChatCompletions):
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.sent = []
+
+    def create(self, **kwargs):
+        self.sent.append(kwargs)
+        return super().create(**kwargs)
+
+
+def _last_user_text(kwargs):
+    for m in reversed(kwargs.get("messages") or []):
+        if m.get("role") == "user":
+            return m.get("content")
+    return None
+
+
+def test_continue_after_per_turn_pause_resumes_with_instruction(monkeypatch):
+    agent = _make_agent(
+        monkeypatch,
+        [_tool_response(500, 100), _tool_response(500, 100, call_id="call_2")],
+    )
+    rec = _RecordingCompletions([])
+    agent._client_calls.create = rec.create
+    rec.responses = agent._client_calls.responses
+    _set_budget(agent, per_turn=1_000)
+
+    r1 = agent.run_conversation("research the thing")
+    assert r1["turn_exit_reason"] == TOKEN_BUDGET_EXCEEDED
+    assert agent._token_budget_paused is True
+
+    rec.responses.append(_text_response("finished the thing"))
+    r2 = agent.run_conversation("continue", conversation_history=r1["messages"])
+    assert r2["final_response"] == "finished the thing"
+    # Model saw the resume instruction ...
+    assert _last_user_text(rec.sent[-1]) == RESUME_INSTRUCTION
+    # ... transcript keeps the user's literal message (persist override;
+    # ``_persist_session`` is stubbed in this harness, so apply it here).
+    assert agent._persist_user_message_override == "continue"
+    agent._apply_persist_user_message_override(r2["messages"])
+    users = [m for m in r2["messages"] if m.get("role") == "user"]
+    assert users[-1]["content"] == "continue"
+    assert agent._token_budget_paused is False
+
+
+def test_continue_resumes_from_transcript_after_agent_rebuild(monkeypatch):
+    """Gateway cache eviction rebuilds the agent and drops in-memory flags;
+    the pause is then recognised from the last assistant message."""
+    agent = _make_agent(monkeypatch, [])
+    rec = _RecordingCompletions([_text_response("resumed")])
+    agent._client_calls.create = rec.create
+    _set_budget(agent, per_turn=1_000)
+    history = [
+        {"role": "user", "content": "do it"},
+        {"role": "assistant", "content": "Paused (token budget): this task used 1,200 tokens ..."},
+    ]
+    r = agent.run_conversation("continue", conversation_history=history)
+    assert r["final_response"] == "resumed"
+    assert _last_user_text(rec.sent[-1]) == RESUME_INSTRUCTION
+
+
+def test_plain_continue_without_pause_is_untouched(monkeypatch):
+    agent = _make_agent(monkeypatch, [])
+    rec = _RecordingCompletions([_text_response("ok")])
+    agent._client_calls.create = rec.create
+    _set_budget(agent, per_turn=1_000)
+    history = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+    agent.run_conversation("continue", conversation_history=history)
+    assert _last_user_text(rec.sent[-1]) == "continue"

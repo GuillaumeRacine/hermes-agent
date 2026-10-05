@@ -254,7 +254,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
                         api_kwargs=api_kwargs,
                     )
                 )
-                result["response"] = request_client.chat.completions.create(**api_kwargs)
+                from agent.request_hygiene import drop_orphan_tool_fields
+                result["response"] = request_client.chat.completions.create(
+                    **drop_orphan_tool_fields(dict(api_kwargs))
+                )
         except Exception as e:
             # If the request was cancelled by the main thread's interrupt
             # handler, the transport error is the expected consequence of our
@@ -571,7 +574,19 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 def build_api_kwargs(agent, api_messages: list) -> dict:
-    """Build the keyword arguments dict for the active API mode."""
+    """Build the keyword arguments dict for the active API mode.
+
+    Every provider path funnels through :func:`drop_orphan_tool_fields` so a
+    ``tool_choice`` / ``parallel_tool_calls`` is never sent without a
+    non-empty ``tools`` list (xAI 400s on it -- hermes-home#330).
+    """
+    from agent.request_hygiene import drop_orphan_tool_fields
+
+    return drop_orphan_tool_fields(_build_api_kwargs_for_mode(agent, api_messages))
+
+
+def _build_api_kwargs_for_mode(agent, api_messages: list) -> dict:
+    """Provider-specific kwargs builder behind :func:`build_api_kwargs`."""
     tools_for_api = agent.tools
 
     if agent.api_mode == "anthropic_messages":
@@ -1530,6 +1545,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     )
     messages.append({"role": "user", "content": summary_request})
 
+    api_messages: list = []
     try:
         # Build API messages, stripping internal-only fields
         # (finish_reason, reasoning) that strict APIs like Mistral reject with 422
@@ -1616,8 +1632,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             summary_extra_body["tags"] = _portal_tags()
 
         if agent.api_mode == "codex_responses":
-            codex_kwargs = agent._build_api_kwargs(api_messages)
-            codex_kwargs.pop("tools", None)
+            codex_kwargs = _strip_tool_fields(agent._build_api_kwargs(api_messages))
             summary_response = agent._run_codex_stream(codex_kwargs)
             _ct_sum = agent._get_transport()
             _cnr_sum = _ct_sum.normalize_response(summary_response)
@@ -1699,8 +1714,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         else:
             # Retry summary generation
             if agent.api_mode == "codex_responses":
-                codex_kwargs = agent._build_api_kwargs(api_messages)
-                codex_kwargs.pop("tools", None)
+                codex_kwargs = _strip_tool_fields(agent._build_api_kwargs(api_messages))
                 retry_response = agent._run_codex_stream(codex_kwargs)
                 _ct_retry = agent._get_transport()
                 _cnr_retry = _ct_retry.normalize_response(retry_response)
@@ -1743,10 +1757,103 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
 
     except Exception as e:
-        logger.warning(f"Failed to get summary response: {e}")
-        final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
+        # Never post a raw provider error to the user (hermes-home#330: an
+        # xAI 400 about tool_choice was delivered verbatim to Slack).  Retry
+        # once with the most conservative request shape, then fall back to a
+        # locally built progress note.
+        logger.warning("Failed to get summary response: %s", e)
+        final_response = ""
+        if api_messages:
+            final_response = _retry_plain_summary(agent, api_messages)
+        if not final_response:
+            final_response = _local_progress_summary(agent, messages, api_call_count)
+        messages.append({"role": "assistant", "content": final_response})
 
     return final_response
+
+
+def _strip_tool_fields(kwargs: dict) -> dict:
+    """Remove ``tools`` and every tool-only key from a request.
+
+    The max-iterations summary must not call tools; popping only ``tools``
+    left ``tool_choice="auto"`` behind, which xAI rejects with HTTP 400
+    (hermes-home#330).
+    """
+    from agent.request_hygiene import drop_orphan_tool_fields
+
+    kwargs.pop("tools", None)
+    return drop_orphan_tool_fields(kwargs)
+
+
+def _retry_plain_summary(agent, api_messages: list) -> str:
+    """One conservative retry of the max-iterations summary call.
+
+    Drops tools / tool_choice / reasoning extras and any extra_body so a
+    provider that rejected the richer request shape gets the plainest
+    possible one.  Returns ``""`` on any failure.
+    """
+    try:
+        if agent.api_mode == "codex_responses":
+            kw = _strip_tool_fields(agent._build_api_kwargs(api_messages))
+            for key in ("reasoning", "include", "extra_body"):
+                kw.pop(key, None)
+            resp = agent._run_codex_stream(kw)
+            text = (agent._get_transport().normalize_response(resp).content or "").strip()
+        elif agent.api_mode == "anthropic_messages":
+            _t = agent._get_transport()
+            kw = _t.build_kwargs(model=agent.model, messages=api_messages, tools=None,
+                                 max_tokens=agent.max_tokens, reasoning_config=None,
+                                 is_oauth=agent._is_anthropic_oauth,
+                                 preserve_dots=agent._anthropic_preserve_dots())
+            resp = agent._anthropic_messages_create(_strip_tool_fields(kw))
+            text = (_t.normalize_response(resp, strip_tool_prefix=agent._is_anthropic_oauth).content or "").strip()
+        else:
+            kw = {"model": agent.model, "messages": api_messages}
+            if agent.max_tokens is not None:
+                kw.update(agent._max_tokens_param(agent.max_tokens))
+            resp = agent._ensure_primary_openai_client(
+                reason="iteration_limit_summary_plain_retry"
+            ).chat.completions.create(**kw)
+            text = (agent._get_transport().normalize_response(resp).content or "").strip()
+    except Exception as exc:
+        logger.warning("Plain summary retry also failed: %s", exc)
+        return ""
+    if "<think>" in text:
+        text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
+    return text
+
+
+def _local_progress_summary(agent, messages: list, api_call_count: int) -> str:
+    """User-facing fallback when no model summary could be produced.
+
+    Built purely from the local transcript (no API call): step count, the
+    most recent tools used and the last substantive assistant note.  The
+    raw provider error stays in the logs, never in the reply.
+    """
+    from agent.token_budget import describe_progress
+
+    progress = describe_progress(messages, api_call_count)
+    last_note = ""
+    for msg in reversed(messages or []):
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            last_note = re.sub(r'<think>.*?</think>\s*', '', content, flags=re.DOTALL).strip()
+            if last_note:
+                break
+    lines = [
+        f"I hit my step limit ({agent.max_iterations} tool-calling steps) before "
+        "finishing, and couldn't generate a written summary."
+    ]
+    if progress:
+        lines.append(f"Progress so far: {progress}.")
+    if last_note:
+        if len(last_note) > 600:
+            last_note = last_note[:600].rstrip() + "..."
+        lines.append(f"Last update: {last_note}")
+    lines.append("Reply `continue` to pick up where I left off.")
+    return "\n".join(lines)
 
 
 
@@ -2046,7 +2153,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # ``request_client_holder["diag"]`` for closure access.
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
-        stream = request_client.chat.completions.create(**stream_kwargs)
+        from agent.request_hygiene import drop_orphan_tool_fields
+        stream = request_client.chat.completions.create(**drop_orphan_tool_fields(stream_kwargs))
 
         # Capture rate limit headers from the initial HTTP response.
         # The OpenAI SDK Stream object exposes the underlying httpx

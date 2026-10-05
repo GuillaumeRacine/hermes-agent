@@ -13,6 +13,9 @@ Hermetic-test invariants enforced here (see AGENTS.md for rationale):
 3. **Deterministic runtime.** TZ=UTC, LANG=C.UTF-8, PYTHONHASHSEED=0.
 4. **No HERMES_SESSION_* inheritance** — the agent's current gateway
    session must not leak into tests.
+5. **No writes to live logs.** Import-time ``_hermes_home`` caches are
+   re-pointed at the test home and root-logger file handlers aimed at the
+   real ``~/.hermes`` are stripped before every test.
 
 These invariants make the local test run match CI closely. Gaps that
 remain (CPU count, xdist worker count) are addressed by the canonical
@@ -30,6 +33,45 @@ import pytest
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# ── Live-runtime log guard ──────────────────────────────────────────────────
+#
+# The real Hermes home(s) as seen when the test process started — before any
+# fixture rewrites HERMES_HOME. Nothing in the suite may log into these.
+_REAL_HERMES_HOMES = frozenset(
+    Path(p).expanduser().resolve()
+    for p in (
+        os.environ.get("HERMES_HOME", "").strip() or None,
+        str(Path.home() / ".hermes"),
+    )
+    if p
+)
+
+# Modules that cache ``get_hermes_home()`` at IMPORT time and later hand it to
+# ``hermes_logging.setup_logging()``. Test files import them at collection
+# time, before ``_hermetic_environment`` sets HERMES_HOME, so the cached value
+# is the LIVE ~/.hermes: every AIAgent built in a test then attached a handler
+# to the real agent.log / errors.log (agent/agent_init.py, gateway/run.py).
+_IMPORT_TIME_HERMES_HOME_MODULES = ("run_agent", "gateway.run")
+
+
+def _strip_real_home_log_handlers() -> None:
+    """Detach and close root-logger file handlers aimed at the live home."""
+    import logging
+
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        filename = getattr(handler, "baseFilename", None)
+        if not filename:
+            continue
+        resolved = Path(filename).resolve()
+        if any(resolved.is_relative_to(home) for home in _REAL_HERMES_HOMES):
+            root.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:
+                pass
 
 
 # ── Per-file process isolation ──────────────────────────────────────────────
@@ -359,6 +401,16 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+
+    # 3b. Re-point import-time HERMES_HOME caches (see
+    #     _IMPORT_TIME_HERMES_HOME_MODULES) and drop any log handler that
+    #     already reached the live ~/.hermes/logs, so no test can append to
+    #     the running gateway's agent.log / errors.log / gateway.log.
+    for _mod_name in _IMPORT_TIME_HERMES_HOME_MODULES:
+        _mod = sys.modules.get(_mod_name)
+        if _mod is not None and hasattr(_mod, "_hermes_home"):
+            monkeypatch.setattr(_mod, "_hermes_home", fake_hermes_home)
+    _strip_real_home_log_handlers()
 
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.

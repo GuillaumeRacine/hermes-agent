@@ -110,6 +110,78 @@ def get_hermes_home() -> Path:
     return _get_platform_default_hermes_home()
 
 
+def get_process_hermes_home() -> Path:
+    """Return the process-wide Hermes home, ignoring context-local overrides.
+
+    Same resolution as :func:`get_hermes_home` minus the per-task
+    ``set_hermes_home_override`` scope: process-level resources (log files,
+    gateway control files, the default state DB) belong to the process, not
+    to whichever profile a multiplexed request is currently serving.
+    """
+    val = os.environ.get("HERMES_HOME", "").strip()
+    if val:
+        return Path(val)
+    if get_hermes_home_override():
+        return _get_platform_default_hermes_home()
+    return get_hermes_home()
+
+
+class LazyHermesPath(os.PathLike):
+    """A path under the process Hermes home, resolved on every use.
+
+    Drop-in replacement for module-level constants such as
+    ``_hermes_home = get_hermes_home()``.  Those were evaluated at IMPORT
+    time, so any process that imported the module before setting
+    ``HERMES_HOME`` (harnesses, tools, the test suite) kept pointing at the
+    live ``~/.hermes`` and wrote its logs / state there (hermes-home#330).
+
+    Supports ``/``, ``os.fspath``/``Path(...)``, ``str``, equality with
+    paths/strings, and delegates every other attribute (``.parent``,
+    ``.exists()``, ``.resolve()`` ...) to the freshly resolved ``Path``.
+    Call :meth:`resolve_now` (or ``Path(obj)``) to snapshot a real ``Path``.
+    """
+
+    __slots__ = ("_parts",)
+
+    def __init__(self, *parts: str) -> None:
+        object.__setattr__(self, "_parts", tuple(parts))
+
+    def resolve_now(self) -> Path:
+        home = get_process_hermes_home()
+        return home.joinpath(*self._parts) if self._parts else home
+
+    def __fspath__(self) -> str:
+        return str(self.resolve_now())
+
+    def __str__(self) -> str:
+        return str(self.resolve_now())
+
+    def __repr__(self) -> str:
+        return f"LazyHermesPath({str(self.resolve_now())!r})"
+
+    def __format__(self, spec: str) -> str:
+        return format(str(self.resolve_now()), spec)
+
+    def __truediv__(self, other) -> Path:
+        return self.resolve_now() / other
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, LazyHermesPath):
+            return self.resolve_now() == other.resolve_now()
+        if isinstance(other, (str, os.PathLike)):
+            return self.resolve_now() == Path(other)
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self.resolve_now())
+
+    def __bool__(self) -> bool:
+        return True
+
+    def __getattr__(self, name: str):
+        return getattr(self.resolve_now(), name)
+
+
 def get_default_hermes_root() -> Path:
     """Return the root Hermes directory for profile-level operations.
 

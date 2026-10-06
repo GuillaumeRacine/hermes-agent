@@ -62,7 +62,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from hermes_constants import get_hermes_home
+from hermes_constants import LazyHermesPath, get_hermes_home
 
 
 def _launch_cwd_for_session(source: str) -> Optional[str]:
@@ -122,9 +122,12 @@ from hermes_cli.timeouts import (
     get_provider_stale_timeout,
 )
 
-_hermes_home = get_hermes_home()
+# Resolved lazily on every use (hermes-home#330): an import-time snapshot kept
+# pointing at the live ~/.hermes for any process that imported this module
+# before setting HERMES_HOME, so its AIAgents logged into the live logs/.
+_hermes_home = LazyHermesPath()
 _project_env = Path(__file__).parent / '.env'
-_loaded_env_paths = load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
+_loaded_env_paths = load_hermes_dotenv(hermes_home=get_hermes_home(), project_env=_project_env)
 if _loaded_env_paths:
     for _env_path in _loaded_env_paths:
         logger.info("Loaded environment variables from %s", _env_path)
@@ -504,21 +507,35 @@ class AIAgent:
         )
 
     def _get_session_db_for_recall(self):
-        """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.
+        """Return a SessionDB usable by ``session_search``.
 
-        Most frontends pass ``session_db`` into ``AIAgent`` explicitly, but recall
-        is important enough that a missing constructor argument should degrade by
-        opening the default state DB instead of making the advertised
-        ``session_search`` tool unusable.
+        Frontends that persist sessions (gateway, CLI, TUI) pass ``session_db``
+        into ``AIAgent``; recall reuses that handle unchanged.
+
+        An agent built WITHOUT a session DB (offline harnesses, evals, tools)
+        must stay non-persistent. Recall therefore opens a separate READ-ONLY
+        connection (sqlite ``mode=ro``) to the default state DB and caches it on
+        ``_recall_session_db`` -- it is never attached as ``_session_db``, so
+        ``_ensure_db_session`` / ``_flush_messages_to_session_db`` keep seeing
+        ``None`` and write nothing. Before hermes-home#330 this helper assigned
+        a writable ``SessionDB()`` to ``_session_db`` as a side effect, and the
+        agent then persisted its whole run into the live ~/.hermes/state.db.
         """
         if self._session_db is not None:
             return self._session_db
+        recall_db = getattr(self, "_recall_session_db", None)
+        if recall_db is not None:
+            return recall_db
         try:
-            from hermes_state import SessionDB
+            from hermes_state import DEFAULT_DB_PATH, SessionDB
 
-            self._session_db = SessionDB()
-            return self._session_db
-        except Exception as exc:
+            db_path = Path(DEFAULT_DB_PATH)
+            if not db_path.exists():
+                # mode=ro cannot create the file, and there is nothing to recall.
+                return None
+            self._recall_session_db = SessionDB(db_path=db_path, read_only=True)
+            return self._recall_session_db
+        except Exception:
             logger.debug("SessionDB unavailable for recall", exc_info=True)
             return None
 
@@ -3241,6 +3258,16 @@ class AIAgent:
         independently guarded so a failure in one does not prevent the rest.
         """
         task_id = getattr(self, "session_id", None) or ""
+
+        # 0. Close the read-only recall connection (never the shared session DB,
+        #    which the frontend owns).
+        _recall_db = getattr(self, "_recall_session_db", None)
+        if _recall_db is not None:
+            self._recall_session_db = None
+            try:
+                _recall_db.close()
+            except Exception:
+                pass
 
         # 1. Kill background processes for this task
         try:

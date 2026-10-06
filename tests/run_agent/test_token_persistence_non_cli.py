@@ -65,16 +65,29 @@ def test_run_conversation_persists_tokens_for_cron_sessions():
     assert session_db.update_token_counts.call_args.args[0] == "cron-session"
 
 
-def test_session_search_lazily_opens_db_when_entrypoint_did_not_pass_one(monkeypatch):
+def test_session_search_opens_read_only_db_when_entrypoint_did_not_pass_one(
+    monkeypatch, tmp_path
+):
+    """Recall still works without a session DB, but read-only and detached.
+
+    hermes-home#330: the lazily-opened DB used to be assigned to
+    ``agent._session_db``, which made a session-less agent persist its whole
+    run into the live state.db.
+    """
     sentinel_db = object()
     captured = {}
+    opened = {}
+    db_file = tmp_path / "state.db"
+    db_file.write_bytes(b"")
 
     class FakeSessionDB:
-        def __new__(cls):
+        def __new__(cls, db_path=None, read_only=False):
+            opened.update(db_path=db_path, read_only=read_only)
             return sentinel_db
 
     hermes_state = ModuleType("hermes_state")
     hermes_state.SessionDB = FakeSessionDB
+    hermes_state.DEFAULT_DB_PATH = db_file
     monkeypatch.setitem(sys.modules, "hermes_state", hermes_state)
 
     session_search_mod = ModuleType("tools.session_search_tool")
@@ -92,4 +105,6 @@ def test_session_search_lazily_opens_db_when_entrypoint_did_not_pass_one(monkeyp
     assert result["success"] is True
     assert captured["db"] is sentinel_db
     assert captured["query"] == "Hermes"
-    assert agent._session_db is sentinel_db
+    assert opened == {"db_path": db_file, "read_only": True}
+    assert agent._session_db is None
+    assert agent._recall_session_db is sentinel_db

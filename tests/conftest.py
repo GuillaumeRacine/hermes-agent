@@ -48,12 +48,11 @@ _REAL_HERMES_HOMES = frozenset(
     if p
 )
 
-# Modules that cache ``get_hermes_home()`` at IMPORT time and later hand it to
-# ``hermes_logging.setup_logging()``. Test files import them at collection
-# time, before ``_hermetic_environment`` sets HERMES_HOME, so the cached value
-# is the LIVE ~/.hermes: every AIAgent built in a test then attached a handler
-# to the real agent.log / errors.log (agent/agent_init.py, gateway/run.py).
-_IMPORT_TIME_HERMES_HOME_MODULES = ("run_agent", "gateway.run")
+# ``run_agent._hermes_home`` / ``gateway.run._hermes_home`` used to cache
+# ``get_hermes_home()`` at IMPORT time (collection time here), so they held the
+# LIVE ~/.hermes and every AIAgent built in a test logged into it. They are now
+# ``LazyHermesPath`` shims resolved on each use (hermes-home#330), so no
+# re-pointing is needed; the handler strip below stays as a backstop.
 
 
 def _strip_real_home_log_handlers() -> None:
@@ -402,14 +401,9 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
 
-    # 3b. Re-point import-time HERMES_HOME caches (see
-    #     _IMPORT_TIME_HERMES_HOME_MODULES) and drop any log handler that
-    #     already reached the live ~/.hermes/logs, so no test can append to
-    #     the running gateway's agent.log / errors.log / gateway.log.
-    for _mod_name in _IMPORT_TIME_HERMES_HOME_MODULES:
-        _mod = sys.modules.get(_mod_name)
-        if _mod is not None and hasattr(_mod, "_hermes_home"):
-            monkeypatch.setattr(_mod, "_hermes_home", fake_hermes_home)
+    # 3b. Drop any log handler that already reached the live ~/.hermes/logs,
+    #     so no test can append to the running gateway's agent.log /
+    #     errors.log / gateway.log.
     _strip_real_home_log_handlers()
 
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with

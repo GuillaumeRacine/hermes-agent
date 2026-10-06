@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
-from hermes_constants import get_hermes_home
+from hermes_constants import LazyHermesPath, get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -118,7 +118,10 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
 
 T = TypeVar("T")
 
-DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+# Resolved on every use (hermes-home#330): an import-time snapshot made any
+# process that imported this module before setting HERMES_HOME open the live
+# ~/.hermes/state.db. Tests may still monkeypatch it with a plain Path.
+DEFAULT_DB_PATH = LazyHermesPath("state.db")
 
 SCHEMA_VERSION = 16
 
@@ -768,7 +771,7 @@ class SessionDB:
     _CHECKPOINT_EVERY_N_WRITES = 50
 
     def __init__(self, db_path: Path = None, read_only: bool = False):
-        self.db_path = db_path or DEFAULT_DB_PATH
+        self.db_path = Path(db_path or DEFAULT_DB_PATH)
         self.read_only = read_only
 
         self._lock = threading.Lock()
@@ -795,6 +798,20 @@ class SessionDB:
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
+                # No DDL here, but detect existing FTS tables so read-only
+                # callers (session_search recall) can still full-text search.
+                try:
+                    _cur = self._conn.cursor()
+                    self._fts_enabled = (
+                        self._fts_table_probe(_cur, "messages_fts") is True
+                    )
+                    if self._fts_enabled:
+                        self._trigram_available = (
+                            self._fts_table_probe(_cur, "messages_fts_trigram") is True
+                        )
+                except sqlite3.Error:
+                    self._fts_enabled = False
+                    self._trigram_available = False
                 return
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1765,6 +1782,10 @@ class SessionDB:
     ) -> None:
         """Update token counters and backfill model if not already set.
 
+        The first call that records ``billing_provider`` also records its
+        ``model``, so the session row names the model that actually ran on that
+        provider (e.g. a fallback) rather than the requested one.
+
         When *absolute* is False (default), values are **incremented** — use
         this for per-API-call deltas (CLI path).
 
@@ -1795,7 +1816,11 @@ class SessionDB:
                    billing_provider = COALESCE(billing_provider, ?),
                    billing_base_url = COALESCE(billing_base_url, ?),
                    billing_mode = COALESCE(billing_mode, ?),
-                   model = COALESCE(model, ?),
+                   model = CASE
+                       WHEN billing_provider IS NULL AND ? IS NOT NULL AND ? IS NOT NULL
+                       THEN ?
+                       ELSE COALESCE(model, ?)
+                   END,
                    api_call_count = ?
                    WHERE id = ?"""
         else:
@@ -1816,7 +1841,11 @@ class SessionDB:
                    billing_provider = COALESCE(billing_provider, ?),
                    billing_base_url = COALESCE(billing_base_url, ?),
                    billing_mode = COALESCE(billing_mode, ?),
-                   model = COALESCE(model, ?),
+                   model = CASE
+                       WHEN billing_provider IS NULL AND ? IS NOT NULL AND ? IS NOT NULL
+                       THEN ?
+                       ELSE COALESCE(model, ?)
+                   END,
                    api_call_count = COALESCE(api_call_count, 0) + ?
                    WHERE id = ?"""
         params = (
@@ -1834,6 +1863,12 @@ class SessionDB:
             billing_provider,
             billing_base_url,
             billing_mode,
+            # model: the first billed call records the model that actually ran
+            # alongside billing_provider (a fallback turn otherwise left the
+            # REQUESTED model paired with the FALLBACK provider, #330).
+            billing_provider,
+            model,
+            model,
             model,
             api_call_count,
             session_id,

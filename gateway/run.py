@@ -1347,9 +1347,13 @@ _ensure_ssl_certs()
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
-from hermes_constants import get_hermes_home
+from hermes_constants import LazyHermesPath, get_hermes_home
 from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, is_truthy_value
-_hermes_home = get_hermes_home()
+# Resolved lazily on every use (hermes-home#330): an import-time snapshot made
+# any process that imported this module before setting HERMES_HOME write
+# gateway logs / control files into the live ~/.hermes. Process-scoped: it
+# deliberately ignores per-request profile overrides (multiplexer).
+_hermes_home = LazyHermesPath()
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
@@ -18454,7 +18458,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # and gateway.log (INFO+, gateway-component records only).
     # Idempotent, so repeated calls from AIAgent.__init__ won't duplicate.
     from hermes_logging import setup_logging, _safe_stderr
-    setup_logging(hermes_home=_hermes_home, mode="gateway")
+    setup_logging(hermes_home=Path(_hermes_home), mode="gateway")
 
     # Startup security posture audit — warn-on-load, never blocks. Surfaces
     # root / weak-SSH / ephemeral-container / unauthenticated-listener posture
@@ -18470,7 +18474,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             _audit_cfg = read_raw_config()
         except Exception:
             _audit_cfg = None
-        log_startup_security_warnings(hermes_home=_hermes_home, config=_audit_cfg)
+        log_startup_security_warnings(hermes_home=Path(_hermes_home), config=_audit_cfg)
     except Exception as _audit_exc:
         logger.debug("Startup security audit failed (non-fatal): %s", _audit_exc)
 

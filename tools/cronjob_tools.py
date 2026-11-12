@@ -19,9 +19,9 @@ logger = logging.getLogger(__name__)
 # Import from cron module (will be available when properly installed)
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from cron.claim_compat import claim_job_for_fire_result
 from cron.jobs import (
     AmbiguousJobReference,
-    claim_job_for_fire_result,
     create_job,
     get_job,
     list_jobs,

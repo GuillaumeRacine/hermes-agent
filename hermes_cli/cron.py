@@ -369,7 +369,10 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
         print(color(f"Failed to {action} job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1
     job = result.get("job") or result.get("removed_job") or {}
-    print(color(f"{success_verb} job: {job.get('name', job_id)} ({job_id})", Colors.GREEN))
+    skipped = action == "run" and bool(job.get("execution_skipped"))
+    verb = "Skipped" if skipped else success_verb
+    print(color(f"{verb} job: {job.get('name', job_id)} ({job_id})",
+                Colors.YELLOW if skipped else Colors.GREEN))
     if action in {"resume", "run"} and result.get("job", {}).get("next_run_at"):
         print(f"  Next run: {result['job']['next_run_at']}")
     if action == "run":

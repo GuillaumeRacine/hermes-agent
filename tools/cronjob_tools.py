@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.jobs import (
     AmbiguousJobReference,
-    claim_job_for_fire,
+    claim_job_for_fire_result,
     create_job,
     get_job,
     list_jobs,
@@ -524,11 +524,11 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
 def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     """Execute a cron job immediately, outside the scheduler tick.
 
-    Atomically claims the job first via ``claim_job_for_fire`` — the same
+    Atomically claims the job first via ``claim_job_for_fire_result`` — the same
     at-most-once CAS the scheduler/external-provider fire path uses — so a
     concurrently-running gateway ticker cannot also fire it (the claim both
     blocks a duplicate fire and advances ``next_run_at`` for recurring jobs).
-    If the claim is lost (another fire is in flight), this is a no-op.
+    Ineligible jobs and jobs with a fresh claim are skipped with their reason.
 
     The actual firing is delegated to ``run_one_job`` — the single shared
     execute→save→deliver→mark body the ticker and external providers use — so
@@ -538,13 +538,21 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     Returns {"claimed": bool, "success": bool, "error": str|None}.
     """
     job_id = job["id"]
+    claimed = False
     try:
         from cron.scheduler import run_one_job
 
-        # At-most-once claim: bail without running if a tick/other fire owns it.
-        if not claim_job_for_fire(job_id):
+        claim_result = claim_job_for_fire_result(job_id)
+        if claim_result != "claimed":
+            messages = {
+                "paused": "Job is paused; not run.",
+                "disabled": "Job is disabled; not run.",
+                "missing": "Job no longer exists; not run.",
+                "already_claimed": "Job has an active fire claim; not run again.",
+            }
             return {"claimed": False, "success": False,
-                    "error": "Job is already being fired by the scheduler; not run again."}
+                    "error": messages.get(claim_result, "Job was not claimed; not run.")}
+        claimed = True
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
@@ -559,11 +567,14 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
 
     except Exception as e:
         logger.error("Failed to execute cron job %s immediately: %s", job_id, e)
-        try:
-            mark_job_run(job_id, False, str(e))
-        except Exception:
-            pass
-        return {"claimed": True, "success": False, "error": str(e)}
+        # A claim failure must not clear another caller's claim or record a run.
+        if claimed:
+            try:
+                mark_job_run(job_id, False, str(e))
+            except Exception:
+                pass
+        return {"claimed": claimed, "success": False, "error": str(e),
+                "claim_failed": not claimed}
 
 
 def cronjob(
@@ -750,10 +761,11 @@ def cronjob(
             result = _format_job(get_job(job_id) or {"id": job_id})
             result["executed"] = exec_result.get("claimed", False)
             result["execution_success"] = exec_result.get("success", False)
+            if exec_result.get("claim_failed", False):
+                result["execution_error"] = exec_result["error"]
+                return json.dumps({"success": False, "error": exec_result["error"], "job": result}, indent=2)
             if not exec_result.get("claimed", False):
-                result["execution_skipped"] = (
-                    "Already being fired by the scheduler; not run again."
-                )
+                result["execution_skipped"] = exec_result.get("error") or "Job was not claimed; not run."
             elif exec_result.get("error"):
                 result["execution_error"] = exec_result["error"]
             return json.dumps({"success": True, "job": result}, indent=2)

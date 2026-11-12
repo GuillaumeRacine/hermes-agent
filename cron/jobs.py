@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 from hermes_time import now as _hermes_now
 from utils import atomic_replace
+from cron.fire_claim import fire_claim_blocker
 
 try:
     from croniter import croniter
@@ -1347,8 +1348,15 @@ def _machine_id() -> str:
 
 
 def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
+    """Compatibility API: True only when this caller persisted the fire claim."""
+    return claim_job_for_fire_result(job_id, claim_ttl_seconds=claim_ttl_seconds) == "claimed"
+
+
+def claim_job_for_fire_result(job_id: str, *, claim_ttl_seconds: int = 300) -> str:
     """Atomically claim a job for a single external 'fire' (multi-machine
-    at-most-once). Returns True iff THIS caller won the claim.
+    at-most-once). Returns "claimed" only after THIS caller persists the claim.
+    Otherwise returns "missing", "paused", "disabled", or "already_claimed"
+    from the same locked store snapshot; callers must not infer it from a reread.
 
     Used by the external-provider fire path (``CronScheduler.fire_due``) when an
     external scheduler (Chronos) signals a job is due across N gateway replicas:
@@ -1372,17 +1380,13 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
         for job in jobs:
             if job["id"] != job_id:
                 continue
-            if not job.get("enabled", True) or job.get("state") == "paused":
-                return False
             now = _hermes_now()
-            existing = job.get("fire_claim")
-            if existing:
-                try:
-                    claimed_at = _ensure_aware(datetime.fromisoformat(existing["at"]))
-                    if (now - claimed_at).total_seconds() < claim_ttl_seconds:
-                        return False  # someone holds a fresh claim
-                except Exception:
-                    pass  # malformed claim → overwrite
+            reason = fire_claim_blocker(
+                job, now=now, claim_ttl_seconds=claim_ttl_seconds,
+                ensure_aware=_ensure_aware,
+            )
+            if reason is not None:
+                return reason
             job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
@@ -1390,8 +1394,8 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
                 if nxt:
                     job["next_run_at"] = nxt
             save_jobs(jobs)
-            return True
-        return False
+            return "claimed"
+        return "missing"
 
 
 def get_due_jobs() -> List[Dict[str, Any]]:
